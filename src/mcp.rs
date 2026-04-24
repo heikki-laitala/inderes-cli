@@ -27,8 +27,16 @@ const PROTOCOL_HEADER: &str = "MCP-Protocol-Version";
 /// of the original request is enough to ride out a short-lived upstream
 /// blip without masking a real outage.
 const MAX_ATTEMPTS: u32 = 4;
+
+// Production backoff; tests override to nanoseconds so they stay fast.
+#[cfg(not(test))]
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
 const MAX_BACKOFF: Duration = Duration::from_millis(4000);
+#[cfg(test)]
+const INITIAL_BACKOFF: Duration = Duration::from_millis(1);
+#[cfg(test)]
+const MAX_BACKOFF: Duration = Duration::from_millis(4);
 
 /// HTTP statuses worth retrying: rate-limit + canonical transient gateway
 /// errors. 500 is deliberately excluded — a 500 from an MCP server usually
@@ -464,5 +472,329 @@ mod tests {
         let result = extract_result(msg, expected_id).unwrap();
         assert_eq!(result["content"][0]["type"], "text");
         assert_eq!(result["content"][0]["text"], "hi");
+    }
+
+    // --- McpClient integration tests (wiremock) -----------------------------
+    //
+    // These spin up an in-process HTTP server and exercise the full
+    // request/response path: header construction, session-id capture,
+    // retry-on-5xx, content-type branching, DELETE-on-close.
+
+    use serde_json::json;
+    use wiremock::matchers::{header, header_exists, method as wm_method};
+    use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+
+    /// Convenience: build a fresh reqwest client + MockServer + McpClient.
+    async fn fixture() -> (MockServer, McpClient) {
+        let server = MockServer::start().await;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let client = McpClient::new(http, server.uri(), "test-token");
+        (server, client)
+    }
+
+    /// `wiremock::matchers` doesn't ship a "body contains this JSON-RPC
+    /// method" matcher; write a tiny one.
+    struct MethodEq(&'static str);
+    impl Match for MethodEq {
+        fn matches(&self, req: &Request) -> bool {
+            serde_json::from_slice::<Value>(&req.body)
+                .ok()
+                .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(String::from))
+                .is_some_and(|m| m == self.0)
+        }
+    }
+
+    // --- initialize + session tracking --------------------------------------
+
+    #[tokio::test]
+    async fn initialize_captures_session_id_from_response_header() {
+        let (server, mut client) = fixture().await;
+
+        Mock::given(wm_method("POST"))
+            .and(MethodEq("initialize"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "sess-abc123")
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {"serverInfo": {"name": "mock", "version": "0.1"}}
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(wm_method("POST"))
+            .and(MethodEq("notifications/initialized"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        client.initialize().await.unwrap();
+        assert_eq!(client.session_id.as_deref(), Some("sess-abc123"));
+    }
+
+    #[tokio::test]
+    async fn subsequent_requests_echo_session_id_header() {
+        let (server, mut client) = fixture().await;
+
+        // First call: server issues a session id.
+        Mock::given(wm_method("POST"))
+            .and(MethodEq("initialize"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "sess-xyz")
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_json(json!({"jsonrpc":"2.0","id":1,"result":{}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("POST"))
+            .and(MethodEq("notifications/initialized"))
+            .respond_with(ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+
+        // Second call (tools/list) must include the Mcp-Session-Id header.
+        Mock::given(wm_method("POST"))
+            .and(MethodEq("tools/list"))
+            .and(header("Mcp-Session-Id", "sess-xyz"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_json(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[]}})),
+            )
+            .mount(&server)
+            .await;
+
+        client.initialize().await.unwrap();
+        let result = client.list_tools().await.unwrap();
+        assert_eq!(result["tools"], json!([]));
+    }
+
+    // --- call_tool / list_tools JSON path -----------------------------------
+
+    #[tokio::test]
+    async fn call_tool_returns_result_from_json_response() {
+        let (server, mut client) = fixture().await;
+        client.session_id = Some("sess".into()); // skip init
+
+        Mock::given(wm_method("POST"))
+            .and(MethodEq("tools/call"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "result": {"content": [{"type":"text","text":"pong"}]}
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let out = client
+            .call_tool("ping", json!({"a": 1}))
+            .await
+            .expect("call_tool");
+        assert_eq!(out["content"][0]["text"], "pong");
+    }
+
+    #[tokio::test]
+    async fn id_mismatch_surfaces_as_error() {
+        let (server, mut client) = fixture().await;
+
+        Mock::given(wm_method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_json(json!({"jsonrpc":"2.0","id":999,"result":{}})),
+            )
+            .mount(&server)
+            .await;
+
+        let err = client.list_tools().await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("MCP id mismatch"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_object_surfaces_as_error() {
+        let (server, mut client) = fixture().await;
+
+        Mock::given(wm_method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "error": {"code": -32601, "message": "Method not found"}
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let err = client.list_tools().await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("-32601"), "got: {msg}");
+        assert!(msg.contains("Method not found"), "got: {msg}");
+    }
+
+    // --- SSE response path --------------------------------------------------
+
+    #[tokio::test]
+    async fn sse_content_type_parsed_correctly() {
+        let (server, mut client) = fixture().await;
+
+        let sse_body = concat!(
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"ping\"}]}}\n\n",
+        );
+
+        Mock::given(wm_method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_raw(sse_body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let result = client.list_tools().await.unwrap();
+        assert_eq!(result["tools"][0]["name"], "ping");
+    }
+
+    // --- retry behaviour ----------------------------------------------------
+
+    #[tokio::test]
+    async fn retries_on_503_then_succeeds() {
+        let (server, mut client) = fixture().await;
+
+        // First: 503 twice, then success. wiremock serves matchers in
+        // registration order; a bounded matcher is used first, then the
+        // catch-all.
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_json(json!({"jsonrpc":"2.0","id":1,"result":{"ok":true}})),
+            )
+            .mount(&server)
+            .await;
+
+        let out = client.list_tools().await.unwrap();
+        assert_eq!(out["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn exhausting_retries_returns_upstream_error() {
+        let (server, mut client) = fixture().await;
+
+        // Always return 503 — all MAX_ATTEMPTS will fail.
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let err = client.list_tools().await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("503"), "expected upstream 503 surfaced: {msg}");
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_on_400() {
+        let (server, mut client) = fixture().await;
+
+        // Single mock — if our code retried, wiremock would run out of matches
+        // and we'd see a different error. Here we verify the single 400 is
+        // surfaced directly.
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let err = client.list_tools().await.unwrap_err();
+        assert!(format!("{err:#}").contains("400"));
+        // .expect(1) above asserts we called exactly once (no retries).
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_on_500() {
+        // 500 = application error, retrying won't help.
+        let (server, mut client) = fixture().await;
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let err = client.list_tools().await.unwrap_err();
+        assert!(format!("{err:#}").contains("500"));
+    }
+
+    // --- close() / DELETE ---------------------------------------------------
+
+    #[tokio::test]
+    async fn close_sends_delete_with_session_id() {
+        let (server, mut client) = fixture().await;
+        client.session_id = Some("sess-to-close".into());
+
+        Mock::given(wm_method("DELETE"))
+            .and(header("Mcp-Session-Id", "sess-to-close"))
+            .and(header_exists("Authorization"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        client.close().await.unwrap();
+        assert!(client.session_id.is_none(), "session_id should be cleared");
+    }
+
+    #[tokio::test]
+    async fn close_tolerates_404_from_already_evicted_session() {
+        let (server, mut client) = fixture().await;
+        client.session_id = Some("stale".into());
+
+        Mock::given(wm_method("DELETE"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        client.close().await.unwrap(); // 404 is OK
+    }
+
+    #[tokio::test]
+    async fn close_is_noop_without_session_id() {
+        let (_, mut client) = fixture().await;
+        // Never set session_id — close() should return Ok without hitting
+        // the network at all (mock server has no handler registered; if
+        // we did make a request, it would hang waiting for a match).
+        client.close().await.unwrap();
+    }
+
+    // --- is_retryable_status (pure helper) ---------------------------------
+
+    #[test]
+    fn retryable_status_matrix() {
+        for code in [429u16, 502, 503, 504] {
+            assert!(is_retryable_status(StatusCode::from_u16(code).unwrap()));
+        }
+        for code in [200u16, 301, 400, 401, 403, 404, 500, 501, 505] {
+            assert!(!is_retryable_status(StatusCode::from_u16(code).unwrap()));
+        }
     }
 }
