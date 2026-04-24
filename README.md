@@ -1,16 +1,28 @@
 # inderes-cli
 
-Unofficial CLI for the [Inderes MCP server](https://mcp.inderes.com/). A thin terminal-friendly wrapper around the hosted MCP endpoint, designed to pair with an on-demand agent skill (OpenClaw or Hermes) so an agent can reach Inderes data without loading every MCP tool schema into its context on every turn.
+Unofficial CLI for the [Inderes MCP server](https://mcp.inderes.com/). A thin terminal-friendly wrapper around the hosted MCP endpoint, designed to pair with an on-demand agent skill (OpenClaw, Hermes, or ptrclaw) so an agent can reach Inderes data without loading every MCP tool schema into its context on every turn.
 
 > **Disclaimer.** This project is a community tool. It is **not affiliated with Inderes Oyj** and the authors have no relationship with Inderes beyond being subscribers. You need your own [Inderes Premium](https://www.inderes.fi/premium) subscription — the CLI never bypasses authentication.
 
 ## Why this exists
 
-Inderes exposes 16 MCP tools. Registering its MCP server directly with an agent host loads all of those tool schemas into model context on every turn (~1.5–3k tokens, even when unused). This CLI inverts the relationship:
+MCP is a clean protocol for "give an agent a data source" and it's the right answer for most cases. But when a server exposes many tools that an agent uses only occasionally, the default integration has real costs worth surfacing before you adopt it.
 
-- The binary talks MCP to `mcp.inderes.com` privately.
-- The agent sees a single small skill file (~500 tokens) that documents a handful of `inderes <subcommand>` invocations.
-- The agent shells out to `inderes` when it needs Nordic-equity data — on demand, not preloaded.
+**1. Tool schemas are always resident in model context.**
+Inderes exposes 16 tools. Registering its MCP server directly with an agent host means roughly 1.5–3k tokens of tool descriptions sit in the system prompt of every single turn, regardless of what the user is asking. Over a 40-turn conversation that's ~80k tokens of dead weight — paid both in input cost and in the model's attention budget. The MCP spec has no "lazy load" for schemas; they come down at session start and stay.
+
+**2. Most MCP client hosts don't handle OAuth.**
+They accept a static bearer token you paste into config. Inderes's Keycloak issues access tokens that expire in minutes, so the status-quo workflow is "copy fresh token → paste → restart agent → repeat." This CLI does a full PKCE browser login once, stores a refresh token in the OS-appropriate config dir with 0600 perms, and auto-rotates. The agent host never sees credentials.
+
+**3. MCP is agent-only.**
+Useful for agents. Not useful if you want to grep analyst comments from a shell pipeline, cron-schedule earnings-transcript downloads, or pipe results through `jq`. This crate is the missing CLI; every subcommand has `--json` so agent-adjacent scripting works too.
+
+**4. On-demand skills are cheaper than always-on schemas.**
+OpenClaw, Hermes, and ptrclaw all load skill markdown lazily — only when the model decides the skill is relevant to the current turn. A ~400-token skill that teaches the model to shell out to `inderes <subcommand>` is roughly 4–8× cheaper per conversation than keeping 16 full tool schemas permanently resident, and the skill doesn't re-read on every turn the way a system prompt does.
+
+### When you should NOT use this
+
+If your agent is dedicated to Inderes (you use its tools on most turns) or you're running a headless service that talks to one specific MCP server, direct MCP registration is simpler — one line in the host config, and the per-turn context cost is paid on turns where you'd want the schemas loaded anyway. This CLI's win is the occasional-use case: Inderes queries interspersed with other work.
 
 ## Install
 
@@ -141,7 +153,7 @@ Written atomically (tempfile + rename) so a crash can't leave a half-written fil
 - `src/storage.rs` — atomic-rename JSON file at the platform config dir (0600 on Unix).
 - `src/mcp.rs` — MCP 2025-03-26 Streamable HTTP client, handles both `application/json` and `text/event-stream` responses.
 - `src/commands.rs` — subcommand implementations and output formatting.
-- `src/skill/SKILL.md` — embedded at compile time; `inderes install-skill` writes it to disk.
+- `src/skill/{openclaw,hermes,ptrclaw}.md` — embedded at compile time; `inderes install-skill <host>` writes the right one to disk.
 
 ## Development
 
@@ -153,16 +165,6 @@ cargo fmt --all
 ```
 
 CI runs the same checks on `ubuntu-latest`, `macos-latest`, and `windows-latest`.
-
-## Releases
-
-Versions use calendar-versioning (`YYYY.M.D`). A push of a `vYYYY.M.D` tag triggers the release workflow, which builds binaries for the five supported target triples, uploads them to a GitHub Release along with `SHA256SUMS`, and is what `install.sh` points at.
-
-```bash
-git tag v2026.4.24 && git push origin v2026.4.24
-```
-
-Cargo rejects leading zeros in semver components, so `Cargo.toml` uses the same zero-free form (`2026.4.24`) — keep them matched when bumping.
 
 ## License
 
