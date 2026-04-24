@@ -40,7 +40,7 @@ Download `inderes-x86_64-pc-windows-msvc.zip` from the [latest release](https://
 inderes login
 ```
 
-Opens your default browser and signs you in with your Inderes account via OAuth 2.0 (authorization code + PKCE) against Inderes's Keycloak (`sso.inderes.fi`). Tokens are stored in the OS keychain (macOS Keychain / Windows Credential Manager / Linux Secret Service), with a file fallback at the platform config directory if no keychain is available.
+Opens your default browser and signs you in with your Inderes account via OAuth 2.0 (authorization code + PKCE) against Inderes's Keycloak (`sso.inderes.fi`). Tokens are stored as a JSON file in the platform config directory (`0600` on Unix, per-user `%APPDATA%` ACLs on Windows).
 
 If the redirect fails with "Invalid redirect URI", follow the guidance in the [Inderes MCP setup docs](https://mcp.inderes.com/docs/setup) and email `support@inderes.fi` with the client name `inderes-mcp` and the exact error URL.
 
@@ -105,18 +105,18 @@ inderes completions powershell | Out-String | Invoke-Expression
 | `-v` / `-vv` | Increase logging verbosity (`warn` → `info` → `debug`) | `warn` |
 | `INDERES_LOG` | `tracing` env filter (overrides `-v`) | unset |
 
-Tokens are stored under the `inderes-cli` keychain service, user `default`. File fallback paths:
+Token file paths:
 
 - **macOS:** `~/Library/Application Support/com.inderes.inderes-cli/tokens.json`
 - **Linux:** `~/.config/inderes-cli/tokens.json`
 - **Windows:** `%APPDATA%\inderes\inderes-cli\config\tokens.json`
 
-File-based storage uses `0600` permissions on Unix; Windows relies on per-user AppData ACLs.
+Written atomically (tempfile + rename) so a crash can't leave a half-written file. Unix enforces `0600`; Windows relies on per-user AppData ACLs.
 
 ## Architecture
 
 ```
- agent ─┐                    ┌─ keychain / tokens.json
+ agent ─┐                    ┌─ tokens.json (0600)
         │                    │
         ▼                    ▼
      SKILL.md ──shells──▶ inderes ──OAuth──▶ sso.inderes.fi (Keycloak)
@@ -127,7 +127,7 @@ File-based storage uses `0600` permissions on Unix; Windows relies on per-user A
 ```
 
 - `src/oauth.rs` — PKCE S256, loopback redirect on ephemeral port, refresh grant.
-- `src/storage.rs` — keyring-first with atomic-rename file fallback (0600 on Unix).
+- `src/storage.rs` — atomic-rename JSON file at the platform config dir (0600 on Unix).
 - `src/mcp.rs` — MCP 2025-03-26 Streamable HTTP client, handles both `application/json` and `text/event-stream` responses.
 - `src/commands.rs` — subcommand implementations and output formatting.
 - `src/skill/SKILL.md` — embedded at compile time; `inderes install-skill` writes it to disk.

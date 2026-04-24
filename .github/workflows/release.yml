@@ -39,14 +39,11 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install Linux build deps
-        if: runner.os == 'Linux'
+      - name: Install cross-compile toolchain (Linux aarch64)
+        if: matrix.cross == true && runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev pkg-config
-          if [[ "${{ matrix.cross }}" == "true" ]]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
+          sudo apt-get install -y gcc-aarch64-linux-gnu
 
       - name: Configure cross-linker
         if: matrix.cross == true && runner.os == 'Linux'

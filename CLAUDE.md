@@ -6,7 +6,7 @@ Unofficial Rust CLI wrapping the hosted MCP server at `https://mcp.inderes.com/`
 
 **Non-obvious invariants.**
 
-- Tokens live in the OS keychain (macOS Keychain / Windows Credential Manager / Linux Secret Service) with a `0600` file fallback at the platform config dir. Never log, print, or include tokens in error messages.
+- Tokens live as a JSON file at the platform config dir (`directories::ProjectDirs`), written atomically and `chmod 0600` on Unix. No OS keychain integration — we opted for file-only simplicity since this is a personal-use CLI. Never log, print, or include tokens in error messages.
 - Versioning is **calver** (`YYYY.M.D`). Cargo strips leading zeros (`2026.4.24`, not `2026.04.24`); git tags mirror the Cargo version so the release workflow picks them up.
 - Only the `inderes-mcp` Keycloak client ID is guaranteed to have localhost redirects whitelisted; do not hardcode alternates.
 - The crate supports Linux, macOS, and Windows equally. Avoid platform-specific code outside `#[cfg]`-gated helpers (see `storage::set_file_perms_0600`).
