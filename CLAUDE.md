@@ -2,7 +2,7 @@
 
 Unofficial Rust CLI wrapping the hosted MCP server at `https://mcp.inderes.com/`. The binary is installed as `inderes` and talks MCP to the server on the user's behalf after an OAuth 2.0 (auth code + PKCE) sign-in against the Inderes Keycloak realm at `https://sso.inderes.fi/auth/realms/Inderes`.
 
-**Design constraint (do not revisit without discussion).** This is deliberately *not* registered as an MCP server with any agent host. The goal is to keep the agent's per-turn context small: a host that registers the Inderes MCP loads every one of its 16 tool schemas on every turn. Instead, agents invoke the binary via Bash using the `SKILL.md` shipped at `src/skill/SKILL.md` (installed by `inderes install-skill`). Friendly subcommands (`search`, `fundamentals`, `estimates`, `content`, `documents`) cover the common path; `inderes call <tool>` is the escape hatch for the remaining tools.
+**Design constraint (do not revisit without discussion).** This is deliberately *not* registered as an MCP server with any agent host. The goal is to keep the agent's per-turn context small: a host that registers the Inderes MCP loads every one of its 16 tool schemas on every turn. Instead, agents invoke the binary via their terminal/bash tool using one of the embedded `SKILL.md` files (`src/skill/openclaw.md`, `src/skill/hermes.md`) installed by `inderes install-skill <host>`. Friendly subcommands (`search`, `fundamentals`, `estimates`, `content`, `documents`) cover the common path; `inderes call <tool>` is the escape hatch for the remaining tools.
 
 **Non-obvious invariants.**
 

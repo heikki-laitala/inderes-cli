@@ -281,8 +281,8 @@ fn build_args(kv_args: Vec<String>, json_args: Option<String>) -> Result<Value> 
 
 // --- skill + completions ---------------------------------------------------
 
-pub fn install_skill(dest: Option<PathBuf>, force: bool) -> Result<PathBuf> {
-    let target = dest.unwrap_or_else(skill::default_install_path);
+pub fn install_skill(host: skill::Host, dest: Option<PathBuf>, force: bool) -> Result<PathBuf> {
+    let target = dest.unwrap_or_else(|| host.default_install_path());
     let parent = target.parent().context("skill path has no parent")?;
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     if target.exists() && !force {
@@ -291,7 +291,7 @@ pub fn install_skill(dest: Option<PathBuf>, force: bool) -> Result<PathBuf> {
             target.display()
         );
     }
-    fs::write(&target, skill::SKILL_MD).with_context(|| format!("writing {}", target.display()))?;
+    fs::write(&target, host.body()).with_context(|| format!("writing {}", target.display()))?;
     Ok(target)
 }
 

@@ -127,9 +127,11 @@ enum Command {
         list: bool,
     },
 
-    /// Write SKILL.md into the OpenClaw skills directory.
+    /// Write SKILL.md into the chosen agent host's skills directory.
     InstallSkill {
-        /// Destination path (default: ~/.openclaw/skills/inderes/SKILL.md).
+        /// Agent host to install for (openclaw or hermes).
+        host: skill::Host,
+        /// Destination path (default: ~/.<host>/skills/inderes/SKILL.md).
         #[arg(long)]
         dest: Option<PathBuf>,
         /// Overwrite if it already exists.
@@ -286,8 +288,8 @@ async fn run() -> Result<()> {
             }
         }
 
-        Command::InstallSkill { dest, force } => {
-            let path = commands::install_skill(dest, force)?;
+        Command::InstallSkill { host, dest, force } => {
+            let path = commands::install_skill(host, dest, force)?;
             println!("Skill written to {}", path.display());
             Ok(())
         }
