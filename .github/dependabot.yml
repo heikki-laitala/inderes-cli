@@ -1,0 +1,46 @@
+version: 2
+updates:
+  # Rust dependencies — weekly, group minor/patch so we don't get a flood
+  # of near-identical PRs every time a dep releases a point update.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: "Europe/Helsinki"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - cargo
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # Treat patch + minor bumps as one PR per group; majors stay separate
+      # so they get proper review attention.
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # GitHub Actions — same story. Keeps us from falling behind like the
+  # checkout v4 → v6 / upload-artifact v4 → v7 jumps we had to batch
+  # manually.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "08:00"
+      timezone: "Europe/Helsinki"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions-minor-patch:
+        update-types:
+          - minor
+          - patch
