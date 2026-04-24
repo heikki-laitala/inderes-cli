@@ -38,11 +38,17 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     strategy:
       fail-fast: false
+      # macos-x64 (macos-13, Intel) is deliberately absent: install.sh is
+      # arch-agnostic past `uname -m`, so macos-arm64 catches every Darwin-
+      # specific shell quirk we'd notice here (including the bash 3.2 empty-
+      # array issue). Dropping it avoids the long queue on GitHub's scarcer
+      # Intel runner class. release.yml still builds x86_64-apple-darwin
+      # binaries, so Intel Mac users continue to get a prebuilt release
+      # tarball — it's just not CI-smoke-tested.
       matrix:
         include:
           - { os: ubuntu-latest,    target: linux-x64 }
           - { os: ubuntu-24.04-arm, target: linux-arm64 }
-          - { os: macos-13,         target: macos-x64 }
           - { os: macos-latest,     target: macos-arm64 }
     runs-on: ${{ matrix.os }}
     steps:
