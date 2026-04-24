@@ -6,8 +6,13 @@ name: Smoke test install
 # (`--version`, `whoami`). Does NOT attempt OAuth or any MCP call.
 
 on:
-  release:
-    types: [published]
+  # Chain off the Release workflow instead of `release: published`. Events
+  # triggered by GITHUB_TOKEN (which `action-gh-release` uses to publish)
+  # do not propagate to downstream webhook triggers, so `release: published`
+  # silently never fires. `workflow_run` bypasses that restriction.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -26,6 +31,10 @@ env:
 jobs:
   install-sh:
     name: install.sh (${{ matrix.target }})
+    # workflow_run fires on both success AND failure of the upstream workflow;
+    # skip this run if the Release that triggered us didn't succeed. For
+    # manual workflow_dispatch runs, always proceed.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -41,10 +50,15 @@ jobs:
       - name: Resolve version
         id: v
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ github.event.inputs.tag }}"
           if [[ -z "$tag" ]]; then
-            tag="${{ github.event.release.tag_name }}"
+            # workflow_run payload doesn't expose the tag directly; just
+            # pick whichever release is newest on the repo.
+            tag=$(gh release view --repo "${{ github.repository }}" \
+                    --json tagName --jq .tagName)
           fi
           if [[ -z "$tag" ]]; then
             tag="latest"
@@ -90,6 +104,7 @@ jobs:
 
   install-ps1:
     name: install.ps1 (windows-x64)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -97,10 +112,15 @@ jobs:
       - name: Resolve version
         id: v
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ github.event.inputs.tag }}"
           if [[ -z "$tag" ]]; then
-            tag="${{ github.event.release.tag_name }}"
+            # workflow_run payload doesn't expose the tag directly; just
+            # pick whichever release is newest on the repo.
+            tag=$(gh release view --repo "${{ github.repository }}" \
+                    --json tagName --jq .tagName)
           fi
           if [[ -z "$tag" ]]; then
             tag="latest"
