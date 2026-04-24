@@ -51,6 +51,7 @@ Append `--json` on any subcommand to get raw JSON (easier to post-process).
 2. If you don't already know the `COMPANY:<id>`, run `inderes search "<name>"` and pick the best match. Never guess IDs.
 3. Call the most specific friendly subcommand for the task. Prefer a narrow `--field` selection over pulling all fields — large dumps bloat context.
 4. For anything outside the friendly-subcommand set, fall through to the escape hatch:
+
    ```bash
    inderes call --list                                      # show all 16 tools
    inderes call list-transcripts --arg companyId=COMPANY:200 --arg first=10
@@ -60,6 +61,7 @@ Append `--json` on any subcommand to get raw JSON (easier to post-process).
    inderes call search-forum-topics --arg text=Nokia --arg order=relevancy
    inderes call get-model-portfolio-content
    ```
+
    `--arg KEY=VALUE` auto-parses JSON values (numbers, booleans, arrays, objects, quoted strings) and otherwise treats them as plain strings. For a full object, use `--json-args '{"key":"value"}'`.
 5. Paginate when lists exceed expected size. Most list tools expose `--first` and `--after`; grab the next cursor from `pageInfo.endCursor` in `--json` output.
 6. Respect language preferences: pass `--lang en` (or `fi`/`sv`/`da`) to `inderes content get` / `inderes call get-transcript` when the user wants a specific language.
