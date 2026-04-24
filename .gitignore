@@ -1,0 +1,14 @@
+/target
+Cargo.lock.bak
+
+# Local artifacts that must never be committed
+tokens.json
+*.pem
+.env
+.env.local
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

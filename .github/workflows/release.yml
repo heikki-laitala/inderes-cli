@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: inderes
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,   cross: false, archive: tar.gz }
+          - { os: ubuntu-latest,  target: aarch64-unknown-linux-gnu,  cross: true,  archive: tar.gz }
+          - { os: macos-latest,   target: x86_64-apple-darwin,        cross: false, archive: tar.gz }
+          - { os: macos-latest,   target: aarch64-apple-darwin,       cross: false, archive: tar.gz }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,     cross: false, archive: zip    }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu
+          fi
+
+      - name: Configure cross-linker
+        if: matrix.cross == true && runner.os == 'Linux'
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'CFG'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          CFG
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          NAME="${BIN}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${{ matrix.target }}/release/${BIN}" "dist/${NAME}/"
+          cp README.md LICENSE "dist/${NAME}/"
+          (cd dist && tar -czf "${NAME}.tar.gz" "${NAME}")
+          (cd dist && shasum -a 256 "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $Name = "$env:BIN-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$Name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/$env:BIN.exe" "dist/$Name/"
+          Copy-Item README.md "dist/$Name/"
+          Copy-Item LICENSE "dist/$Name/"
+          Compress-Archive -Path "dist/$Name" -DestinationPath "dist/$Name.zip"
+          $hash = Get-FileHash -Algorithm SHA256 "dist/$Name.zip"
+          "$($hash.Hash.ToLower())  $Name.zip" | Out-File -Encoding ascii "dist/$Name.zip.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BIN }}-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Aggregate SHA256SUMS
+        run: |
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          ls -la
+
+      - name: Create/update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS

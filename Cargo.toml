@@ -1,0 +1,42 @@
+[package]
+name = "inderes-cli"
+version = "2026.4.24"
+edition = "2021"
+rust-version = "1.82"
+authors = ["Heikki Laitala"]
+description = "Unofficial CLI for the Inderes MCP server. Wraps the HTTP MCP endpoint behind a terminal-friendly interface with OAuth (PKCE) login, designed to pair with OpenClaw skills for token-efficient agent access."
+license = "MIT"
+repository = "https://github.com/heikki-laitala/inderes-cli"
+homepage = "https://github.com/heikki-laitala/inderes-cli"
+readme = "README.md"
+keywords = ["inderes", "mcp", "cli", "openclaw", "oauth"]
+categories = ["command-line-utilities", "api-bindings"]
+
+[[bin]]
+name = "inderes"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4"
+directories = "5"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
+url = "2"
+webbrowser = "1"
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
