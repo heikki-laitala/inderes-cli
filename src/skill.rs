@@ -59,15 +59,19 @@ mod tests {
     #[test]
     fn openclaw_path_ends_with_openclaw_skills() {
         let p = Host::Openclaw.default_install_path();
-        let s = p.to_string_lossy();
-        assert!(s.ends_with(".openclaw/skills/inderes/SKILL.md"), "got {s}");
+        let tail: PathBuf = [".openclaw", "skills", "inderes", "SKILL.md"]
+            .iter()
+            .collect();
+        assert!(p.ends_with(&tail), "got {}", p.display());
     }
 
     #[test]
     fn hermes_path_ends_with_hermes_skills() {
         let p = Host::Hermes.default_install_path();
-        let s = p.to_string_lossy();
-        assert!(s.ends_with(".hermes/skills/inderes/SKILL.md"), "got {s}");
+        let tail: PathBuf = [".hermes", "skills", "inderes", "SKILL.md"]
+            .iter()
+            .collect();
+        assert!(p.ends_with(&tail), "got {}", p.display());
     }
 
     #[test]
