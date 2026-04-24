@@ -262,7 +262,7 @@ fn random_verifier() -> String {
 
 fn random_urlsafe(n_bytes: usize) -> String {
     let mut buf = vec![0u8; n_bytes];
-    rand::thread_rng().fill(&mut buf[..]);
+    rand::rng().fill(&mut buf[..]);
     BASE64_URL_SAFE_NO_PAD.encode(&buf)
 }
 
