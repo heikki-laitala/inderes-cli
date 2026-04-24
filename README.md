@@ -30,9 +30,15 @@ cargo install --git https://github.com/heikki-laitala/inderes-cli
 
 Requires Rust 1.82+.
 
-### Windows
+### Windows — PowerShell (recommended)
 
-Download `inderes-x86_64-pc-windows-msvc.zip` from the [latest release](https://github.com/heikki-laitala/inderes-cli/releases/latest), extract, and put `inderes.exe` on your `PATH`.
+```powershell
+iwr -useb https://raw.githubusercontent.com/heikki-laitala/inderes-cli/main/install.ps1 | iex
+```
+
+Installs `inderes.exe` into `%LOCALAPPDATA%\Programs\inderes\bin` and prints a PATH reminder if needed. Verifies SHA-256 before installing.
+
+Or download `inderes-x86_64-pc-windows-msvc.zip` from the [latest release](https://github.com/heikki-laitala/inderes-cli/releases/latest) manually.
 
 ## First run
 

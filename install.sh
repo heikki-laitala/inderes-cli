@@ -8,6 +8,8 @@
 #   INDERES_VERSION=v0.1.0       install a specific tag (default: latest)
 #   INDERES_INSTALL_DIR=~/bin    install directory (default: ~/.local/bin)
 #   INDERES_REPO=owner/repo      release source (default: heikki-laitala/inderes-cli)
+#   GH_TOKEN=<token>             forwarded as `Authorization: Bearer` on GitHub
+#                                requests — needed when the repo is private.
 
 set -euo pipefail
 
@@ -26,6 +28,13 @@ require() {
 require curl
 require tar
 
+# Optional: authenticated downloads for private releases. Curl's -L does not
+# forward auth on redirect, so the S3-signed URL stays clean.
+curl_auth=()
+if [[ -n "${GH_TOKEN:-}" ]]; then
+  curl_auth+=(-H "Authorization: Bearer $GH_TOKEN")
+fi
+
 os="$(uname -s | tr '[:upper:]' '[:lower:]')"
 arch="$(uname -m)"
 
@@ -41,7 +50,7 @@ esac
 
 if [[ "$VERSION" == "latest" ]]; then
   log "Resolving latest release for $REPO"
-  VERSION="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
+  VERSION="$(curl -fsSL "${curl_auth[@]}" "https://api.github.com/repos/$REPO/releases/latest" \
     | awk -F'"' '/"tag_name":/ {print $4; exit}')"
   [[ -n "$VERSION" ]] || die "could not determine latest tag"
 fi
@@ -54,10 +63,10 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 log "Downloading $archive ($VERSION)"
-curl -fsSL -o "$tmp/$archive" "$url" || die "download failed: $url"
+curl -fsSL "${curl_auth[@]}" -o "$tmp/$archive" "$url" || die "download failed: $url"
 
 log "Verifying checksum"
-if curl -fsSL -o "$tmp/$archive.sha256" "$sum_url" 2>/dev/null; then
+if curl -fsSL "${curl_auth[@]}" -o "$tmp/$archive.sha256" "$sum_url" 2>/dev/null; then
   (cd "$tmp" && shasum -a 256 -c "$archive.sha256") \
     || die "checksum mismatch — refusing to install"
 else

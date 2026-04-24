@@ -1,0 +1,127 @@
+name: Smoke test install
+
+# Runs against a real published GitHub Release. Exercises the same install
+# scripts that users see (`install.sh` / `install.ps1`), verifies the binary
+# unpacks, ends up in the expected location, and responds to no-auth commands
+# (`--version`, `whoami`). Does NOT attempt OAuth or any MCP call.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to smoke-test (blank = latest)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  # GITHUB_TOKEN is needed while the repo is private so the install scripts
+  # can authenticate their API + asset downloads. Harmless once public.
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  install-sh:
+    name: install.sh (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    target: linux-x64 }
+          - { os: ubuntu-24.04-arm, target: linux-arm64 }
+          - { os: macos-13,         target: macos-x64 }
+          - { os: macos-latest,     target: macos-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version
+        id: v
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag }}"
+          if [[ -z "$tag" ]]; then
+            tag="${{ github.event.release.tag_name }}"
+          fi
+          if [[ -z "$tag" ]]; then
+            tag="latest"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Smoke-testing tag: $tag"
+
+      - name: Run install.sh
+        env:
+          INDERES_VERSION: ${{ steps.v.outputs.tag }}
+          INDERES_INSTALL_DIR: ${{ github.workspace }}/bin
+        run: ./install.sh
+
+      - name: Verify binary location
+        run: |
+          test -x "${{ github.workspace }}/bin/inderes" \
+            || { echo "binary missing or not executable"; exit 1; }
+
+      - name: Verify --version
+        run: |
+          output="$("${{ github.workspace }}/bin/inderes" --version)"
+          echo "$output"
+          echo "$output" | grep -q '^inderes ' \
+            || { echo "unexpected version output"; exit 1; }
+
+      - name: Verify whoami (no-auth path)
+        run: |
+          output="$("${{ github.workspace }}/bin/inderes" whoami)"
+          echo "$output"
+          echo "$output" | grep -q 'Not signed in' \
+            || { echo "unexpected whoami output"; exit 1; }
+
+  install-ps1:
+    name: install.ps1 (windows-x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve version
+        id: v
+        shell: bash
+        run: |
+          tag="${{ github.event.inputs.tag }}"
+          if [[ -z "$tag" ]]; then
+            tag="${{ github.event.release.tag_name }}"
+          fi
+          if [[ -z "$tag" ]]; then
+            tag="latest"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Smoke-testing tag: $tag"
+
+      - name: Run install.ps1
+        shell: pwsh
+        env:
+          INDERES_VERSION: ${{ steps.v.outputs.tag }}
+          INDERES_INSTALL_DIR: ${{ github.workspace }}\bin
+        run: ./install.ps1
+
+      - name: Verify binary location
+        shell: pwsh
+        run: |
+          $bin = "${{ github.workspace }}\bin\inderes.exe"
+          if (-not (Test-Path $bin)) { throw "binary missing at $bin" }
+
+      - name: Verify --version
+        shell: pwsh
+        run: |
+          $bin = "${{ github.workspace }}\bin\inderes.exe"
+          $out = & $bin --version
+          Write-Host $out
+          if (-not ($out -match '^inderes ')) { throw "unexpected version output: $out" }
+
+      - name: Verify whoami (no-auth path)
+        shell: pwsh
+        run: |
+          $bin = "${{ github.workspace }}\bin\inderes.exe"
+          $out = & $bin whoami
+          Write-Host $out
+          if (-not ($out -match 'Not signed in')) { throw "unexpected whoami output: $out" }
