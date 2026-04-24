@@ -83,8 +83,11 @@ impl<'a> ToolCtx<'a> {
 
     async fn call(&self, tool: &str, args: Value) -> Result<()> {
         let mut c = self.client().await?;
-        let result = c.call_tool(tool, args).await?;
-        print_result(&result, self.json_output)
+        let result = c.call_tool(tool, args).await;
+        // Best-effort session cleanup — don't let a failed DELETE turn a
+        // successful tool call into an error.
+        let _ = c.close().await;
+        print_result(&result?, self.json_output)
     }
 }
 
@@ -234,7 +237,9 @@ pub async fn call(
 
 pub async fn call_list(ctx: &ToolCtx<'_>) -> Result<()> {
     let mut c = ctx.client().await?;
-    let result = c.list_tools().await?;
+    let result = c.list_tools().await;
+    let _ = c.close().await;
+    let result = result?;
     if ctx.json_output {
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());

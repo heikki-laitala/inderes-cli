@@ -74,6 +74,30 @@ impl McpClient {
         self.request("tools/list", json!({})).await
     }
 
+    /// Send `DELETE /` with the `Mcp-Session-Id` header to let the server
+    /// release session resources. Best-effort: the 2025-03-26 spec says
+    /// clients SHOULD do this on shutdown but servers may also return 404
+    /// if they've already evicted the session, which we treat as success.
+    pub async fn close(&mut self) -> Result<()> {
+        let Some(sid) = self.session_id.take() else {
+            return Ok(());
+        };
+        let resp = self
+            .http
+            .delete(&self.endpoint)
+            .bearer_auth(&self.access_token)
+            .header(SESSION_HEADER, sid)
+            .send()
+            .await
+            .context("DELETE MCP session")?;
+        let status = resp.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            Ok(())
+        } else {
+            bail!("DELETE MCP session returned {status}")
+        }
+    }
+
     // --- internals ----------------------------------------------------------
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -208,13 +232,21 @@ async fn read_sse_result(resp: reqwest::Response, expected_id: i64) -> Result<Va
 }
 
 fn find_event_boundary(buf: &str) -> Option<usize> {
-    buf.find("\n\n").or_else(|| buf.find("\r\n\r\n")).map(|i| {
-        i + if buf.as_bytes().get(i + 1) == Some(&b'\n') {
-            2
+    // Prefer the 4-byte CRLF form first; otherwise the bare LF form. Picking
+    // the *first* 4-byte boundary would still be correct in any mixed input
+    // because `\r\n\r\n` contains no embedded `\n\n`, but being explicit
+    // about the two forms keeps the split arithmetic obviously right: return
+    // the index **past** the boundary.
+    if let Some(i) = buf.find("\r\n\r\n") {
+        let lf_idx = buf.find("\n\n").unwrap_or(usize::MAX);
+        if lf_idx < i {
+            Some(lf_idx + 2)
         } else {
-            4
+            Some(i + 4)
         }
-    })
+    } else {
+        buf.find("\n\n").map(|i| i + 2)
+    }
 }
 
 fn parse_sse_event(event: &str) -> Result<Option<Value>> {
@@ -223,7 +255,8 @@ fn parse_sse_event(event: &str) -> Result<Option<Value>> {
         if let Some(rest) = line.strip_prefix("data:") {
             data_lines.push(rest.strip_prefix(' ').unwrap_or(rest));
         }
-        // `event:`, `id:`, `retry:` ignored — we only care about data.
+        // `event:`, `id:`, `retry:`, and `:comment` lines are ignored — we
+        // only care about the accumulated `data:` payload.
     }
     if data_lines.is_empty() {
         return Ok(None);
@@ -232,4 +265,151 @@ fn parse_sse_event(event: &str) -> Result<Option<Value>> {
     let v: Value = serde_json::from_str(&joined)
         .with_context(|| format!("parsing SSE data as JSON: {joined}"))?;
     Ok(Some(v))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- find_event_boundary ------------------------------------------------
+
+    #[test]
+    fn boundary_lf_only() {
+        // "a\n\nb" — boundary is "\n\n" at index 1, consumer should start at 3.
+        assert_eq!(find_event_boundary("a\n\nb"), Some(3));
+    }
+
+    #[test]
+    fn boundary_crlf() {
+        // "a\r\n\r\nb" — boundary is the 4-byte CRLF pair at index 1, start at 5.
+        assert_eq!(find_event_boundary("a\r\n\r\nb"), Some(5));
+    }
+
+    #[test]
+    fn boundary_none_when_incomplete() {
+        assert_eq!(find_event_boundary(""), None);
+        assert_eq!(find_event_boundary("hello"), None);
+        assert_eq!(find_event_boundary("one\nline"), None);
+        assert_eq!(find_event_boundary("half\r\n"), None);
+    }
+
+    #[test]
+    fn boundary_lf_wins_when_earlier() {
+        // "a\n\nbbb\r\n\r\n" — LF pair at index 1 beats CRLF pair at index 6.
+        assert_eq!(find_event_boundary("a\n\nbbb\r\n\r\n"), Some(3));
+    }
+
+    #[test]
+    fn boundary_consumer_can_split_correctly() {
+        // Integration-style: after split_at(idx), the rest should begin with
+        // the next event (not leftover boundary bytes).
+        let buf = "data: one\r\n\r\ndata: two\r\n\r\n";
+        let idx = find_event_boundary(buf).expect("boundary");
+        let (event, rest) = buf.split_at(idx);
+        assert_eq!(event, "data: one\r\n\r\n");
+        assert_eq!(rest, "data: two\r\n\r\n");
+    }
+
+    // --- parse_sse_event ----------------------------------------------------
+
+    #[test]
+    fn parse_empty_returns_none() {
+        assert!(parse_sse_event("").unwrap().is_none());
+        assert!(parse_sse_event("event: message\n").unwrap().is_none());
+        assert!(parse_sse_event(": keep-alive comment\n").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_single_line_data() {
+        let v = parse_sse_event("data: {\"id\":1,\"result\":\"ok\"}")
+            .unwrap()
+            .unwrap();
+        assert_eq!(v.get("id").and_then(|v| v.as_i64()), Some(1));
+        assert_eq!(v.get("result").and_then(|v| v.as_str()), Some("ok"));
+    }
+
+    #[test]
+    fn parse_strips_single_leading_space_only() {
+        // SSE spec: exactly one leading space after "data:" is a delimiter.
+        // Additional spaces survive as payload — here the second space lands
+        // INSIDE the JSON string literal so it reaches the parsed value.
+        let v = parse_sse_event("data:  \" preserved\"").unwrap().unwrap();
+        assert_eq!(v.as_str(), Some(" preserved"));
+    }
+
+    #[test]
+    fn parse_accepts_no_space_after_colon() {
+        // `data:foo` (no space) is valid per spec — the entire rest is payload.
+        let v = parse_sse_event("data:\"tight\"").unwrap().unwrap();
+        assert_eq!(v.as_str(), Some("tight"));
+    }
+
+    #[test]
+    fn parse_multiline_data_joins_with_newlines() {
+        // Per spec, multiple `data:` lines in one event are concatenated with
+        // a `\n` between them.
+        let event = "data: {\ndata:   \"id\": 1\ndata: }";
+        let v = parse_sse_event(event).unwrap().unwrap();
+        assert_eq!(v["id"], 1);
+    }
+
+    #[test]
+    fn parse_ignores_unknown_fields() {
+        let event = "event: message\nid: 42\nretry: 100\n: comment\ndata: {\"hello\":\"world\"}";
+        let v = parse_sse_event(event).unwrap().unwrap();
+        assert_eq!(v["hello"], "world");
+    }
+
+    #[test]
+    fn parse_reports_invalid_json() {
+        let err = parse_sse_event("data: {not json").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("parsing SSE data as JSON"), "got: {msg}");
+    }
+
+    // --- end-to-end SSE frame handling --------------------------------------
+    //
+    // Drives find_event_boundary + parse_sse_event together on a realistic
+    // MCP-shaped payload containing one server notification followed by the
+    // expected response. The notification (method + no id) should be
+    // skipped; the response should be returned.
+
+    #[test]
+    fn chunked_stream_skips_notifications_and_returns_response() {
+        let mut buf = String::new();
+        // Chunks the server might have flushed separately:
+        let chunks = [
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n\n",
+        ];
+        let expected_id: i64 = 1;
+        let mut found: Option<Value> = None;
+
+        for chunk in chunks {
+            buf.push_str(chunk);
+            while let Some(idx) = find_event_boundary(&buf) {
+                let (event, rest) = buf.split_at(idx);
+                let event_owned = event.to_string();
+                buf = rest.trim_start_matches(['\n', '\r']).to_string();
+
+                if let Some(msg) = parse_sse_event(&event_owned).unwrap() {
+                    if msg.get("method").is_some() && msg.get("id").is_none() {
+                        continue; // server notification — ignore
+                    }
+                    if msg.get("id").and_then(|v| v.as_i64()) == Some(expected_id) {
+                        found = Some(msg);
+                        break;
+                    }
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+
+        let msg = found.expect("response with id=1 should be found");
+        let result = extract_result(msg, expected_id).unwrap();
+        assert_eq!(result["content"][0]["type"], "text");
+        assert_eq!(result["content"][0]["text"], "hi");
+    }
 }

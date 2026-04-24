@@ -79,7 +79,7 @@ pub async fn login(http: &reqwest::Client, scopes: &[&str], open_browser: bool) 
         Err(_) => bail!("login timed out after 5 minutes"),
     };
 
-    let tokens = exchange_code(http, &code, &redirect_uri, &verifier, scopes).await?;
+    let tokens = exchange_code(http, &code, &redirect_uri, &verifier).await?;
     Ok(tokens)
 }
 
@@ -136,7 +136,6 @@ async fn exchange_code(
     code: &str,
     redirect_uri: &str,
     verifier: &str,
-    _scopes: &[&str],
 ) -> Result<Tokens> {
     let params = [
         ("grant_type", "authorization_code"),
