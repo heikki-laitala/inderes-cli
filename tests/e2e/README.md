@@ -6,7 +6,7 @@ without authentication.
 
 ## What each validator proves
 
-For each host (OpenClaw, Hermes):
+For each host (OpenClaw, Hermes, ptrclaw):
 
 1. Runs `inderes install-skill <host> --dest <tempdir>/inderes/SKILL.md --force`.
 2. Feeds the resulting file to that host's own skill-loading code and asserts:
@@ -30,6 +30,7 @@ Defaults to:
 
 - `OPENCLAW_DIR=~/dev/agents/openclaw`
 - `HERMES_DIR=~/dev/agents/hermes-agent`
+- `PTRCLAW_DIR=~/dev/agents/ptrclaw`
 
 Override either with an env var, or skip a job:
 
@@ -37,10 +38,14 @@ Override either with an env var, or skip a job:
 OPENCLAW_DIR=/some/path ./tests/e2e/run-local.sh
 SKIP_OPENCLAW=1 ./tests/e2e/run-local.sh
 SKIP_HERMES=1   ./tests/e2e/run-local.sh
+SKIP_PTRCLAW=1  ./tests/e2e/run-local.sh
 ```
 
-The first run installs dependencies into `~/dev/agents/openclaw/node_modules`
-and `tests/e2e/openclaw/node_modules` — subsequent runs are fast.
+The first OpenClaw run installs dependencies into
+`~/dev/agents/openclaw/node_modules` and `tests/e2e/openclaw/node_modules` —
+subsequent runs are fast. The ptrclaw validator is a small C++ program compiled
+on demand against ptrclaw's own `skill.cpp` + `util.cpp`; it needs a working
+`c++` (or `$CXX`) compiler on PATH.
 
 ## Running in CI
 
@@ -55,6 +60,11 @@ Host repos are pinned to specific commit SHAs via workflow `env`:
 
 Bump them deliberately (e.g. quarterly) by editing the workflow. Unpinned
 `main` would make CI fragile — an unrelated upstream change could break us.
+
+`ptrclaw` is deliberately **not pinned**: it's the owner's own repo and the
+goal is to catch skill-contract breakage between ptrclaw and inderes-cli
+as soon as it appears. The ptrclaw job always clones `heikki-laitala/ptrclaw`
+at `main`.
 
 ## Why not a full agent e2e?
 

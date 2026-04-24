@@ -30,8 +30,8 @@ on:
   workflow_dispatch:
 
 env:
-  # Pinned host SHAs. Bump deliberately; unpinned `main` would introduce
-  # non-deterministic CI failures caused by unrelated upstream changes.
+  # Third-party hosts are pinned to specific SHAs — bump deliberately.
+  # ptrclaw is deliberately unpinned (own repo, always test latest main).
   OPENCLAW_SHA: 8f64cd3e4d8339a6aab3ca230d5e14944c91cfaf
   HERMES_SHA: 62c14d5513469e27474fc9535fcdd4afa016646f
   CARGO_TERM_COLOR: always
@@ -148,3 +148,37 @@ jobs:
           HERMES_DIR: ${{ github.workspace }}/.host/hermes
           INDERES_BIN: ${{ github.workspace }}/.bin/inderes
         run: python3 tests/e2e/hermes/validate.py
+
+  ptrclaw:
+    name: ptrclaw skill loader
+    needs: build-inderes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout inderes-cli
+        uses: actions/checkout@v6
+
+      # ptrclaw lives in the user's own repo and is deliberately not pinned.
+      # We always test against the latest main of heikki-laitala/ptrclaw.
+      - name: Checkout ptrclaw at main
+        uses: actions/checkout@v6
+        with:
+          repository: heikki-laitala/ptrclaw
+          ref: main
+          path: .host/ptrclaw
+
+      - name: Download inderes binary
+        uses: actions/download-artifact@v8
+        with:
+          name: inderes-linux
+          path: .bin
+      - run: chmod +x .bin/inderes
+
+      - name: Build ptrclaw validator
+        env:
+          PTRCLAW_DIR: ${{ github.workspace }}/.host/ptrclaw
+        run: tests/e2e/ptrclaw/build.sh
+
+      - name: Run ptrclaw validator
+        env:
+          INDERES_BIN: ${{ github.workspace }}/.bin/inderes
+        run: tests/e2e/ptrclaw/validate

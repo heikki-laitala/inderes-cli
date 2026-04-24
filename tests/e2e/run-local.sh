@@ -5,8 +5,10 @@
 # Env overrides:
 #   OPENCLAW_DIR  — default: ~/dev/agents/openclaw
 #   HERMES_DIR    — default: ~/dev/agents/hermes-agent
+#   PTRCLAW_DIR   — default: ~/dev/agents/ptrclaw
 #   SKIP_OPENCLAW=1 — skip the OpenClaw job
 #   SKIP_HERMES=1   — skip the Hermes job
+#   SKIP_PTRCLAW=1  — skip the ptrclaw job
 
 set -euo pipefail
 
@@ -15,6 +17,7 @@ e2e_dir="$repo_root/tests/e2e"
 
 OPENCLAW_DIR="${OPENCLAW_DIR:-$HOME/dev/agents/openclaw}"
 HERMES_DIR="${HERMES_DIR:-$HOME/dev/agents/hermes-agent}"
+PTRCLAW_DIR="${PTRCLAW_DIR:-$HOME/dev/agents/ptrclaw}"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m!!\033[0m  %s\n' "$*" >&2; exit 1; }
@@ -58,6 +61,16 @@ else
   HERMES_DIR="$HERMES_DIR" \
     INDERES_BIN="$INDERES_BIN" \
     python3 "$e2e_dir/hermes/validate.py"
+fi
+
+# ---- ptrclaw ----------------------------------------------------------------
+if [[ "${SKIP_PTRCLAW:-0}" == "1" ]]; then
+  log "Skipping ptrclaw (SKIP_PTRCLAW=1)"
+else
+  [[ -d "$PTRCLAW_DIR" ]] || fail "PTRCLAW_DIR not found: $PTRCLAW_DIR"
+  log "ptrclaw validator (PTRCLAW_DIR=$PTRCLAW_DIR)"
+  PTRCLAW_DIR="$PTRCLAW_DIR" "$e2e_dir/ptrclaw/build.sh"
+  INDERES_BIN="$INDERES_BIN" "$e2e_dir/ptrclaw/validate"
 fi
 
 log "All e2e checks passed"

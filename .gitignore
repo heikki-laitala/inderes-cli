@@ -12,6 +12,8 @@ tests/e2e/**/node_modules/
 tests/e2e/**/package-lock.json
 tests/e2e/**/__pycache__/
 tests/e2e/**/*.pyc
+tests/e2e/ptrclaw/validate
+tests/e2e/ptrclaw/*.o
 
 # Editor / OS noise
 .DS_Store
