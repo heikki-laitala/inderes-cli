@@ -363,3 +363,321 @@ fn parse_callback_path(path: &str, expected_state: &str) -> Result<String, Strin
 const CALLBACK_SUCCESS_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>inderes-cli — signed in</title></head><body style="font-family:-apple-system,system-ui,sans-serif;max-width:28rem;margin:4rem auto;text-align:center"><h1>Signed in</h1><p>You can close this tab and return to the terminal.</p></body></html>"#;
 
 const CALLBACK_ERROR_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>inderes-cli — error</title></head><body style="font-family:-apple-system,system-ui,sans-serif;max-width:28rem;margin:4rem auto;text-align:center"><h1>Sign-in failed</h1><p>Check the terminal for details.</p></body></html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{body_string_contains, method as wm_method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // --- Pure helpers ------------------------------------------------------
+
+    #[test]
+    fn pkce_s256_matches_rfc_fixture() {
+        // Test vector from RFC 7636 §4.5. Verifier is 43 ASCII chars; the
+        // known-good challenge is "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        let challenge = pkce_s256(verifier);
+        assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    #[test]
+    fn random_verifier_is_rfc_compliant_length() {
+        // RFC 7636 requires 43..=128 unreserved chars. Base64url of 64 bytes
+        // gives 86 chars — comfortably inside the range.
+        let v = random_verifier();
+        assert!(v.len() >= 43 && v.len() <= 128, "got {}", v.len());
+        // URL-safe no-pad uses only [A-Za-z0-9_-].
+        assert!(
+            v.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "non-urlsafe chars in {v}"
+        );
+    }
+
+    #[test]
+    fn random_urlsafe_length_varies_with_input() {
+        // 32 bytes → 43 base64url chars (no padding).
+        assert_eq!(random_urlsafe(32).len(), 43);
+        // 24 bytes → 32 base64url chars.
+        assert_eq!(random_urlsafe(24).len(), 32);
+    }
+
+    // --- IdpConfig ---------------------------------------------------------
+
+    #[test]
+    fn idp_default_points_at_inderes() {
+        let cfg = IdpConfig::inderes_default();
+        assert_eq!(cfg.client_id, "inderes-mcp");
+        assert!(cfg.authorization_endpoint.contains("sso.inderes.fi"));
+        assert!(cfg.token_endpoint.ends_with("/token"));
+        assert!(cfg.userinfo_endpoint.ends_with("/userinfo"));
+    }
+
+    #[test]
+    fn idp_from_env_layers_overrides() {
+        // SAFETY: setting env vars in tests is only race-safe if no other
+        // test in this module also mutates the same vars. We isolate by
+        // using unique var names — but the `from_env()` fn reads fixed names,
+        // so we do one sequential mutation set + restore.
+        let keys = [
+            ("INDERES_IDP_AUTH_URL", "https://staging/auth"),
+            ("INDERES_IDP_TOKEN_URL", "https://staging/token"),
+            ("INDERES_IDP_USERINFO_URL", "https://staging/userinfo"),
+            ("INDERES_IDP_CLIENT_ID", "staging-client"),
+        ];
+        for (k, v) in keys {
+            // SAFETY: tests run serially by default when they touch env.
+            unsafe { std::env::set_var(k, v) };
+        }
+        let cfg = IdpConfig::from_env();
+        assert_eq!(cfg.authorization_endpoint, "https://staging/auth");
+        assert_eq!(cfg.token_endpoint, "https://staging/token");
+        assert_eq!(cfg.userinfo_endpoint, "https://staging/userinfo");
+        assert_eq!(cfg.client_id, "staging-client");
+        for (k, _) in keys {
+            unsafe { std::env::remove_var(k) };
+        }
+    }
+
+    // --- build_auth_url ----------------------------------------------------
+
+    #[test]
+    fn build_auth_url_attaches_pkce_and_scopes() {
+        let cfg = IdpConfig::inderes_default();
+        let url = build_auth_url(
+            &cfg,
+            "http://127.0.0.1:12345/callback",
+            "challenge-xyz",
+            "state-abc",
+            &["openid", "offline_access"],
+        )
+        .unwrap();
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q.get("response_type").map(String::as_str), Some("code"));
+        assert_eq!(q.get("client_id").map(String::as_str), Some("inderes-mcp"));
+        assert_eq!(
+            q.get("redirect_uri").map(String::as_str),
+            Some("http://127.0.0.1:12345/callback")
+        );
+        assert_eq!(q.get("state").map(String::as_str), Some("state-abc"));
+        assert_eq!(
+            q.get("code_challenge").map(String::as_str),
+            Some("challenge-xyz")
+        );
+        assert_eq!(
+            q.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        // scopes are joined with a space.
+        assert_eq!(
+            q.get("scope").map(String::as_str),
+            Some("openid offline_access")
+        );
+    }
+
+    // --- parse_callback_path ----------------------------------------------
+
+    #[test]
+    fn parse_callback_happy_path_returns_code() {
+        let code = parse_callback_path("/callback?code=abc123&state=s1", "s1").unwrap();
+        assert_eq!(code, "abc123");
+    }
+
+    #[test]
+    fn parse_callback_rejects_state_mismatch_as_csrf() {
+        let err = parse_callback_path("/callback?code=abc&state=bad", "good").unwrap_err();
+        assert!(err.contains("state mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_missing_state() {
+        let err = parse_callback_path("/callback?code=abc", "s1").unwrap_err();
+        assert!(err.contains("missing `state`"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_wrong_path() {
+        let err = parse_callback_path("/elsewhere?code=x", "s").unwrap_err();
+        assert!(err.contains("unexpected callback path"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_callback_surfaces_error_param() {
+        let err = parse_callback_path(
+            "/callback?error=access_denied&error_description=User+declined&state=s1",
+            "s1",
+        )
+        .unwrap_err();
+        assert!(err.contains("access_denied"), "got: {err}");
+        assert!(err.contains("User declined"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_callback_rejects_missing_code() {
+        let err = parse_callback_path("/callback?state=s1", "s1").unwrap_err();
+        assert!(err.contains("missing `code`"), "got: {err}");
+    }
+
+    // --- Token endpoint (wiremock) ----------------------------------------
+
+    fn test_idp(server: &MockServer) -> IdpConfig {
+        IdpConfig {
+            authorization_endpoint: format!("{}/auth", server.uri()),
+            token_endpoint: format!("{}/token", server.uri()),
+            userinfo_endpoint: format!("{}/userinfo", server.uri()),
+            client_id: "test-client".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_parses_happy_response() {
+        let server = MockServer::start().await;
+        let idp = test_idp(&server);
+
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("client_id=test-client"))
+            .and(body_string_contains("refresh_token=rt-old"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "new-access",
+                "refresh_token": "rt-new",
+                "expires_in": 300,
+                "token_type": "Bearer",
+                "scope": "openid offline_access"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let tokens = refresh(&http, &idp, "rt-old").await.unwrap();
+        assert_eq!(tokens.access_token, "new-access");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("rt-new"));
+        assert_eq!(tokens.token_type.as_deref(), Some("Bearer"));
+        // Expiry should be ~300s in the future.
+        let remaining = (tokens.expires_at - OffsetDateTime::now_utc()).whole_seconds();
+        assert!(
+            (290..=310).contains(&remaining),
+            "expected ~300s, got {remaining}"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_surfaces_keycloak_error() {
+        let server = MockServer::start().await;
+        let idp = test_idp(&server);
+
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "invalid_grant",
+                "error_description": "Refresh token expired"
+            })))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let err = refresh(&http, &idp, "rt-expired").await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("invalid_grant"), "got: {msg}");
+        assert!(msg.contains("Refresh token expired"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn refresh_handles_missing_expires_in() {
+        // Some IdPs omit expires_in; we fall back to 300s.
+        let server = MockServer::start().await;
+        let idp = test_idp(&server);
+
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "a",
+            })))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let tokens = refresh(&http, &idp, "r").await.unwrap();
+        let remaining = (tokens.expires_at - OffsetDateTime::now_utc()).whole_seconds();
+        assert!(
+            (290..=310).contains(&remaining),
+            "expected default ~300s, got {remaining}"
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_code_posts_authorization_code_grant() {
+        let server = MockServer::start().await;
+        let idp = test_idp(&server);
+
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/token"))
+            .and(body_string_contains("grant_type=authorization_code"))
+            .and(body_string_contains("code=auth-code"))
+            .and(body_string_contains("code_verifier=verif-xyz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "a",
+                "refresh_token": "r",
+                "expires_in": 600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let tokens = exchange_code(
+            &http,
+            &idp,
+            "auth-code",
+            "http://127.0.0.1:12345/callback",
+            "verif-xyz",
+        )
+        .await
+        .unwrap();
+        assert_eq!(tokens.access_token, "a");
+    }
+
+    // --- userinfo (wiremock) ----------------------------------------------
+
+    #[tokio::test]
+    async fn userinfo_returns_claims_on_200() {
+        let server = MockServer::start().await;
+        let idp = test_idp(&server);
+
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/userinfo"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "sub": "user-123",
+                "preferred_username": "alice",
+                "email": "alice@example.com"
+            })))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let claims = userinfo(&http, &idp, "access-token").await.unwrap();
+        assert_eq!(claims["preferred_username"], "alice");
+        assert_eq!(claims["email"], "alice@example.com");
+    }
+
+    #[tokio::test]
+    async fn userinfo_bubbles_401() {
+        let server = MockServer::start().await;
+        let idp = test_idp(&server);
+
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/userinfo"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let err = userinfo(&http, &idp, "expired-token").await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("401"), "got: {msg}");
+    }
+}
