@@ -27,7 +27,7 @@ jobs:
           - { os: macos-latest,   target: aarch64-apple-darwin,       cross: false, archive: tar.gz }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,     cross: false, archive: zip    }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -82,7 +82,7 @@ jobs:
           "$($hash.Hash.ToLower())  $Name.zip" | Out-File -Encoding ascii "dist/$Name.zip.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.BIN }}-${{ matrix.target }}
           path: |
@@ -97,10 +97,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -112,7 +112,7 @@ jobs:
           ls -la
 
       - name: Create/update release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           name: ${{ github.event.inputs.tag || github.ref_name }}
