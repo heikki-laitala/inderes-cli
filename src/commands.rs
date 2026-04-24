@@ -263,7 +263,7 @@ pub async fn call_list(ctx: &ToolCtx<'_>) -> Result<()> {
     Ok(())
 }
 
-fn build_args(kv_args: Vec<String>, json_args: Option<String>) -> Result<Value> {
+pub(crate) fn build_args(kv_args: Vec<String>, json_args: Option<String>) -> Result<Value> {
     if let Some(raw) = json_args {
         let v: Value =
             serde_json::from_str(&raw).with_context(|| format!("parsing --json-args: {raw}"))?;
@@ -419,4 +419,214 @@ pub fn kv_to_args(pairs: &[(&str, &str)]) -> Value {
 #[allow(dead_code)]
 fn _stable_map_type() -> HashMap<String, Value> {
     HashMap::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // --- build_args --------------------------------------------------------
+
+    #[test]
+    fn build_args_parses_json_values_when_possible() {
+        let args = build_args(
+            vec![
+                "count=10".into(),
+                "enabled=true".into(),
+                "tags=[\"a\",\"b\"]".into(),
+                "config={\"k\":1}".into(),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(args["count"], 10);
+        assert_eq!(args["enabled"], true);
+        assert_eq!(args["tags"], json!(["a", "b"]));
+        assert_eq!(args["config"]["k"], 1);
+    }
+
+    #[test]
+    fn build_args_falls_back_to_string_when_value_not_json() {
+        let args = build_args(vec!["name=NOKIA".into()], None).unwrap();
+        assert_eq!(args["name"], "NOKIA");
+    }
+
+    #[test]
+    fn build_args_handles_values_with_equals_sign() {
+        // split_once('=') should yield the first =, leaving "b=c" as value.
+        let args = build_args(vec!["formula=a=b+c".into()], None).unwrap();
+        assert_eq!(args["formula"], "a=b+c");
+    }
+
+    #[test]
+    fn build_args_rejects_missing_equals() {
+        let err = build_args(vec!["bogus".into()], None).unwrap_err();
+        assert!(format!("{err:#}").contains("KEY=VALUE"));
+    }
+
+    #[test]
+    fn build_args_json_args_overrides_kv_args() {
+        // When --json-args is provided, KV args are ignored entirely.
+        let args = build_args(
+            vec!["ignored=me".into()],
+            Some(r#"{"override": true}"#.into()),
+        )
+        .unwrap();
+        assert_eq!(args, json!({"override": true}));
+    }
+
+    #[test]
+    fn build_args_json_args_must_be_object() {
+        let err = build_args(vec![], Some("[1,2,3]".into())).unwrap_err();
+        assert!(format!("{err:#}").contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn build_args_json_args_rejects_invalid_json() {
+        let err = build_args(vec![], Some("{bogus".into())).unwrap_err();
+        assert!(format!("{err:#}").contains("parsing --json-args"));
+    }
+
+    #[test]
+    fn build_args_empty_yields_empty_object() {
+        let args = build_args(vec![], None).unwrap();
+        assert_eq!(args, json!({}));
+    }
+
+    // --- render_result / render_content_item ------------------------------
+
+    fn render(result: &Value) -> String {
+        let mut buf = Vec::new();
+        render_result(result, &mut buf).expect("render");
+        String::from_utf8(buf).expect("utf8")
+    }
+
+    #[test]
+    fn render_text_content_emits_body() {
+        let out = render(&json!({
+            "content": [{"type": "text", "text": "hello world"}]
+        }));
+        assert_eq!(out.trim(), "hello world");
+    }
+
+    #[test]
+    fn render_multiple_text_items_prints_each() {
+        let out = render(&json!({
+            "content": [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"}
+            ]
+        }));
+        assert!(out.contains("first"));
+        assert!(out.contains("second"));
+    }
+
+    #[test]
+    fn render_image_content_prints_placeholder_with_mime_and_size() {
+        let b64 = "AAAA".repeat(1000); // 4000 chars
+        let out = render(&json!({
+            "content": [{"type": "image", "mimeType": "image/png", "data": b64}]
+        }));
+        assert!(out.contains("[image:"));
+        assert!(out.contains("image/png"));
+        assert!(out.contains("4000 bytes"));
+        // Critical: raw base64 must NOT reach stdout.
+        assert!(!out.contains("AAAA"));
+    }
+
+    #[test]
+    fn render_audio_content_prints_placeholder() {
+        let out = render(&json!({
+            "content": [{"type": "audio", "mimeType": "audio/wav", "data": "XXXX"}]
+        }));
+        assert!(out.contains("[audio:"));
+        assert!(out.contains("audio/wav"));
+    }
+
+    #[test]
+    fn render_resource_with_text_inlines_content() {
+        let out = render(&json!({
+            "content": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///tmp/x.txt",
+                    "mimeType": "text/plain",
+                    "text": "body contents"
+                }
+            }]
+        }));
+        assert!(out.contains("[resource: file:///tmp/x.txt"));
+        assert!(out.contains("text/plain"));
+        assert!(out.contains("body contents"));
+    }
+
+    #[test]
+    fn render_resource_with_blob_prints_binary_placeholder() {
+        let out = render(&json!({
+            "content": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///tmp/x.bin",
+                    "blob": "BASE64DATA"
+                }
+            }]
+        }));
+        assert!(out.contains("[resource: file:///tmp/x.bin (binary)"));
+        assert!(!out.contains("BASE64DATA"));
+    }
+
+    #[test]
+    fn render_unknown_content_type_prints_passthrough_hint() {
+        let out = render(&json!({
+            "content": [{"type": "future-type", "whatever": 42}]
+        }));
+        assert!(out.contains("[future-type content"));
+        assert!(out.contains("--json"));
+    }
+
+    #[test]
+    fn render_empty_content_array_prints_placeholder() {
+        let out = render(&json!({"content": []}));
+        assert_eq!(out.trim(), "(empty result)");
+    }
+
+    #[test]
+    fn render_without_content_key_falls_back_to_pretty_json() {
+        let out = render(&json!({"foo": "bar"}));
+        assert!(out.contains("\"foo\""));
+        assert!(out.contains("\"bar\""));
+    }
+
+    // --- print_result wrapper (isError branch) -----------------------------
+
+    #[test]
+    fn print_result_surfaces_is_error() {
+        // Non-JSON path: prints content, then bails with the isError signal.
+        // The "tool said no" body lands on stdout as a side effect, which
+        // cargo captures under --show-output only.
+        let err = print_result(
+            &json!({
+                "content": [{"type": "text", "text": "tool said no"}],
+                "isError": true
+            }),
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("isError=true"));
+    }
+
+    #[test]
+    fn print_result_json_mode_does_not_consult_is_error() {
+        // --json preserves the raw MCP shape; user decides how to interpret.
+        // isError=true with --json should NOT terminate the process.
+        let res = print_result(
+            &json!({
+                "content": [{"type": "text", "text": "ok"}],
+                "isError": true
+            }),
+            true,
+        );
+        assert!(res.is_ok(), "--json should not fail on isError");
+    }
 }
