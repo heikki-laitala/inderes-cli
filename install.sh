@@ -31,8 +31,14 @@ require() {
 require curl
 require tar
 
-# Optional: authenticated downloads for private releases. Curl's -L does not
-# forward auth on redirect, so the S3-signed URL stays clean.
+# Optional: authenticated downloads for private releases or rate-limit boost.
+# Curl's -L does not forward auth on redirect, so the S3-signed URL stays clean.
+#
+# NOTE on the `${curl_auth[@]+"${curl_auth[@]}"}` expansion used below: macOS
+# ships bash 3.2 where `"${empty_array[@]}"` triggers `set -u`'s unbound-
+# variable error. The `${arr[@]+…}` form expands to nothing when the array
+# is empty, bypassing the quirk. Required for macOS runners; harmless on
+# bash 4+.
 curl_auth=()
 if [[ -n "${GH_TOKEN:-}" ]]; then
   curl_auth+=(-H "Authorization: Bearer $GH_TOKEN")
@@ -53,7 +59,7 @@ esac
 
 if [[ "$VERSION" == "latest" ]]; then
   log "Resolving latest release for $REPO"
-  VERSION="$(curl -fsSL "${curl_auth[@]}" "https://api.github.com/repos/$REPO/releases/latest" \
+  VERSION="$(curl -fsSL ${curl_auth[@]+"${curl_auth[@]}"} "https://api.github.com/repos/$REPO/releases/latest" \
     | awk -F'"' '/"tag_name":/ {print $4; exit}')"
   [[ -n "$VERSION" ]] || die "could not determine latest tag"
 fi
@@ -70,7 +76,7 @@ trap 'rm -rf "$tmp"' EXIT
 asset_accept=()
 if [[ -n "${GH_TOKEN:-}" ]]; then
   log "Resolving asset IDs for $VERSION"
-  release_meta="$(curl -fsSL "${curl_auth[@]}" \
+  release_meta="$(curl -fsSL ${curl_auth[@]+"${curl_auth[@]}"} \
     -H "Accept: application/vnd.github+json" \
     "https://api.github.com/repos/$REPO/releases/tags/$VERSION")" \
     || die "could not read release metadata for $VERSION"
@@ -104,12 +110,12 @@ else
 fi
 
 log "Downloading $archive ($VERSION)"
-curl -fsSL "${curl_auth[@]}" "${asset_accept[@]}" -o "$tmp/$archive" "$archive_url" \
+curl -fsSL ${curl_auth[@]+"${curl_auth[@]}"} ${asset_accept[@]+"${asset_accept[@]}"} -o "$tmp/$archive" "$archive_url" \
   || die "download failed: $archive_url"
 
 log "Verifying checksum"
 if [[ -n "$sums_url" ]] && \
-   curl -fsSL "${curl_auth[@]}" "${asset_accept[@]}" -o "$tmp/SHA256SUMS" "$sums_url" 2>/dev/null; then
+   curl -fsSL ${curl_auth[@]+"${curl_auth[@]}"} ${asset_accept[@]+"${asset_accept[@]}"} -o "$tmp/SHA256SUMS" "$sums_url" 2>/dev/null; then
   sum_line="$(grep -E "[[:space:]]${archive}\$" "$tmp/SHA256SUMS" || true)"
   if [[ -n "$sum_line" ]]; then
     (cd "$tmp" && printf '%s\n' "$sum_line" | shasum -a 256 -c -) \
