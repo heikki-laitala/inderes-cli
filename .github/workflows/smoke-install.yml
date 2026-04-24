@@ -23,10 +23,11 @@ on:
 permissions:
   contents: read
 
-env:
-  # GITHUB_TOKEN is needed while the repo is private so the install scripts
-  # can authenticate their API + asset downloads. Harmless once public.
-  GH_TOKEN: ${{ github.token }}
+# GH_TOKEN deliberately NOT set at workflow level. The repo is public, so
+# install.sh / install.ps1 should exercise the same anonymous download
+# path that the README tells real users to run. The scripts' GH_TOKEN
+# branch is still code-path-tested via `cargo test` helpers; no need to
+# duplicate it here.
 
 jobs:
   install-sh:

@@ -8,8 +8,11 @@
 #   $env:INDERES_INSTALL_DIR  install directory
 #                             (default: %LOCALAPPDATA%\Programs\inderes\bin)
 #   $env:INDERES_REPO         release source (default: heikki-laitala/inderes-cli)
-#   $env:GH_TOKEN             forwarded as `Authorization: Bearer` on GitHub
-#                             requests — needed when the repo is private.
+#   $env:GH_TOKEN             optional — when set, forwarded as
+#                             `Authorization: Bearer` so GitHub's API calls
+#                             use the 5000/hr authenticated rate limit
+#                             (vs 60/hr anonymous) and private-repo mirrors
+#                             work.
 
 $ErrorActionPreference = "Stop"
 

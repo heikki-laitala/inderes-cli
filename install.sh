@@ -8,8 +8,11 @@
 #   INDERES_VERSION=v0.1.0       install a specific tag (default: latest)
 #   INDERES_INSTALL_DIR=~/bin    install directory (default: ~/.local/bin)
 #   INDERES_REPO=owner/repo      release source (default: heikki-laitala/inderes-cli)
-#   GH_TOKEN=<token>             forwarded as `Authorization: Bearer` on GitHub
-#                                requests — needed when the repo is private.
+#   GH_TOKEN=<token>             optional — when set, forwarded as
+#                                `Authorization: Bearer` so GitHub's API calls
+#                                use the 5000/hr authenticated rate limit
+#                                (vs 60/hr anonymous) and private-repo
+#                                mirrors work.
 
 set -euo pipefail
 

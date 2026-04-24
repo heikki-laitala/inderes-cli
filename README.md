@@ -32,7 +32,9 @@ If your agent is dedicated to Inderes (you use its tools on most turns) or you'r
 curl -sSL https://raw.githubusercontent.com/heikki-laitala/inderes-cli/main/install.sh | bash
 ```
 
-Downloads the latest release binary for your OS+arch into `~/.local/bin/inderes`, verifies SHA-256, and prints a PATH reminder if needed.
+Downloads the latest release binary for your OS+arch into `~/.local/bin/inderes`, verifies SHA-256 against the release's `SHAxxxxSUMS` sidecar, and prints a PATH reminder if needed. No authentication needed — release assets are public.
+
+If you hit GitHub's anonymous rate limit (60/hr) on a shared network, export `GH_TOKEN=$(gh auth token)` before running to use your authenticated 5000/hr quota.
 
 ### Any platform — cargo
 
@@ -48,7 +50,7 @@ Requires Rust 1.82+.
 iwr -useb https://raw.githubusercontent.com/heikki-laitala/inderes-cli/main/install.ps1 | iex
 ```
 
-Installs `inderes.exe` into `%LOCALAPPDATA%\Programs\inderes\bin` and prints a PATH reminder if needed. Verifies SHA-256 before installing.
+Installs `inderes.exe` into `%LOCALAPPDATA%\Programs\inderes\bin` and prints a PATH reminder if needed. Verifies SHA-256 before installing. Set `$env:GH_TOKEN` first only if you're hitting GitHub's anonymous rate limit.
 
 Or download `inderes-x86_64-pc-windows-msvc.zip` from the [latest release](https://github.com/heikki-laitala/inderes-cli/releases/latest) manually.
 
