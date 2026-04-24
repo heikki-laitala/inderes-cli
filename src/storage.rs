@@ -52,6 +52,14 @@ pub fn backend_description() -> String {
 }
 
 pub fn token_path() -> Result<PathBuf> {
+    // Explicit override is handy both for power users (shared creds across
+    // machines) and for integration tests that need to pre-seed or inspect
+    // the token file without touching a real user profile.
+    if let Ok(explicit) = std::env::var("INDERES_TOKEN_PATH") {
+        if !explicit.is_empty() {
+            return Ok(PathBuf::from(explicit));
+        }
+    }
     let dirs = ProjectDirs::from("com", "inderes", "inderes-cli")
         .context("could not determine platform config directory")?;
     Ok(dirs.config_dir().join("tokens.json"))
