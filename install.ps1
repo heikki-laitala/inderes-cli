@@ -55,7 +55,7 @@ if ($env:GH_TOKEN) {
     try {
         $rel = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$repo/releases/tags/$version"
     } catch {
-        Die "could not read release metadata for $version: $($_.Exception.Message)"
+        Die "could not read release metadata for ${version}: $($_.Exception.Message)"
     }
     $archiveAsset = $rel.assets | Where-Object { $_.name -eq $archive } | Select-Object -First 1
     $sumsAsset    = $rel.assets | Where-Object { $_.name -eq "SHA256SUMS" } | Select-Object -First 1
