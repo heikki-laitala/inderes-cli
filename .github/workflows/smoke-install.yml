@@ -77,10 +77,10 @@ jobs:
           echo "$output" | grep -q 'Not signed in' \
             || { echo "unexpected whoami output"; exit 1; }
 
-      - name: Verify install-skill for both hosts
+      - name: Verify install-skill for all hosts
         run: |
           tmp="$(mktemp -d)"
-          for host in openclaw hermes; do
+          for host in openclaw hermes ptrclaw; do
             out="$tmp/$host-SKILL.md"
             "${{ github.workspace }}/bin/inderes" install-skill "$host" --dest "$out"
             test -s "$out" \
@@ -137,12 +137,12 @@ jobs:
           Write-Host $out
           if (-not ($out -match 'Not signed in')) { throw "unexpected whoami output: $out" }
 
-      - name: Verify install-skill for both hosts
+      - name: Verify install-skill for all hosts
         shell: pwsh
         run: |
           $bin = "${{ github.workspace }}\bin\inderes.exe"
           $tmp = New-Item -ItemType Directory -Force -Path (Join-Path $env:RUNNER_TEMP "inderes-skill-smoke") | Select-Object -ExpandProperty FullName
-          foreach ($h in @("openclaw", "hermes")) {
+          foreach ($h in @("openclaw", "hermes", "ptrclaw")) {
             $out = Join-Path $tmp "$h-SKILL.md"
             & $bin install-skill $h --dest $out
             if (-not (Test-Path $out) -or ((Get-Item $out).Length -eq 0)) {

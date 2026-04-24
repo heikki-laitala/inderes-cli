@@ -7,6 +7,7 @@ use clap::ValueEnum;
 
 const OPENCLAW_SKILL: &str = include_str!("skill/openclaw.md");
 const HERMES_SKILL: &str = include_str!("skill/hermes.md");
+const PTRCLAW_SKILL: &str = include_str!("skill/ptrclaw.md");
 
 /// Supported agent hosts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -15,6 +16,8 @@ pub enum Host {
     Openclaw,
     /// Hermes Agent — skill at `~/.hermes/skills/inderes/SKILL.md`.
     Hermes,
+    /// ptrclaw — skill at `~/.ptrclaw/skills/inderes/SKILL.md`.
+    Ptrclaw,
 }
 
 impl Host {
@@ -23,6 +26,7 @@ impl Host {
         match self {
             Host::Openclaw => OPENCLAW_SKILL,
             Host::Hermes => HERMES_SKILL,
+            Host::Ptrclaw => PTRCLAW_SKILL,
         }
     }
 
@@ -31,6 +35,7 @@ impl Host {
         let dir = match self {
             Host::Openclaw => ".openclaw",
             Host::Hermes => ".hermes",
+            Host::Ptrclaw => ".ptrclaw",
         };
         home_dir()
             .join(dir)
@@ -51,9 +56,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn both_skills_are_non_empty() {
+    fn all_skills_are_non_empty() {
         assert!(Host::Openclaw.body().contains("name: inderes"));
         assert!(Host::Hermes.body().contains("name: inderes"));
+        assert!(Host::Ptrclaw.body().contains("name: inderes"));
     }
 
     #[test]
@@ -72,6 +78,21 @@ mod tests {
             .iter()
             .collect();
         assert!(p.ends_with(&tail), "got {}", p.display());
+    }
+
+    #[test]
+    fn ptrclaw_path_ends_with_ptrclaw_skills() {
+        let p = Host::Ptrclaw.default_install_path();
+        let tail: PathBuf = [".ptrclaw", "skills", "inderes", "SKILL.md"]
+            .iter()
+            .collect();
+        assert!(p.ends_with(&tail), "got {}", p.display());
+    }
+
+    #[test]
+    fn ptrclaw_skill_names_the_shell_tool() {
+        // ptrclaw's generic subprocess tool is `shell`, not `terminal`.
+        assert!(Host::Ptrclaw.body().contains("`shell`"));
     }
 
     #[test]

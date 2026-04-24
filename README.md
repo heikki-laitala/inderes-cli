@@ -86,16 +86,17 @@ inderes --json search "Nokia" | jq '.content[0].text'
 
 ## Install the skill
 
-The `inderes` binary is designed to be invoked by an agent through an on-demand skill — keeps per-turn context small. Two hosts are supported out of the box:
+The `inderes` binary is designed to be invoked by an agent through an on-demand skill — keeps per-turn context small. Three hosts are supported out of the box:
 
 ```bash
 inderes install-skill openclaw   # -> ~/.openclaw/skills/inderes/SKILL.md
 inderes install-skill hermes     # -> ~/.hermes/skills/inderes/SKILL.md
+inderes install-skill ptrclaw    # -> ~/.ptrclaw/skills/inderes/SKILL.md
 ```
 
 Pass `--force` to overwrite an existing skill, `--dest <path>` to write somewhere else. The skill content is shipped inside the binary, so reinstalling after a CLI upgrade always gives the agent up-to-date guidance.
 
-Both skills teach the model to shell out to `inderes <subcommand>` via the host's terminal/bash tool — no MCP server registration, no tool-schema bloat.
+All three skills teach the model to shell out to `inderes <subcommand>` via the host's terminal/bash/shell tool — no MCP server registration, no tool-schema bloat.
 
 ## Shell completions
 

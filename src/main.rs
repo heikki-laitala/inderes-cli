@@ -129,7 +129,7 @@ enum Command {
 
     /// Write SKILL.md into the chosen agent host's skills directory.
     InstallSkill {
-        /// Agent host to install for (openclaw or hermes).
+        /// Agent host to install for (openclaw, hermes, or ptrclaw).
         host: skill::Host,
         /// Destination path (default: ~/.<host>/skills/inderes/SKILL.md).
         #[arg(long)]
