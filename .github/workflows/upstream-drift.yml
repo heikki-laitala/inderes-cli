@@ -1,0 +1,132 @@
+name: Upstream MCP drift
+
+# Detects when Inderes's hosted MCP server adds, removes, or renames a tool
+# by diffing the public docs page against tests/fixtures/upstream-tools.txt.
+# On drift, opens a GitHub Issue (or comments on the existing open one) so
+# the change gets triaged instead of silently breaking the friendly
+# subcommands / skill files that reference specific tool names.
+#
+# No authentication needed — the docs page at mcp.inderes.com/docs/tools
+# is publicly readable. When the issue lands, the reviewer should:
+#   1. Diff the upstream tool against what src/commands.rs wraps
+#   2. Update SKILL.md bodies if any referenced tool changed
+#   3. Refresh the baseline: cp current-tools.txt tests/fixtures/...
+
+on:
+  schedule:
+    - cron: "23 7 * * *" # daily at 07:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  # If a scheduled run is still going and another fires (manual dispatch),
+  # cancel the older one.
+  group: upstream-drift
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Compare live tools list to baseline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Fetch upstream docs page
+        run: |
+          curl -fsSL "https://mcp.inderes.com/docs/tools" -o current.html
+          bytes=$(wc -c < current.html)
+          if [[ "$bytes" -lt 1000 ]]; then
+            echo "::error::Docs page unexpectedly short ($bytes bytes) — aborting"
+            exit 1
+          fi
+
+      - name: Extract tool names
+        run: |
+          python3 - <<'PY' > current-tools.txt
+          import re
+          from pathlib import Path
+          raw = Path("current.html").read_text(encoding="utf-8")
+          # Tool names appear wrapped in <code>...</code> throughout the
+          # docs page. Restrict to the known kebab-case prefix set so
+          # generic code snippets aren't matched.
+          names = re.findall(
+              r'<code[^>]*>((?:get|list|search|read)-[a-z]+(?:-[a-z]+)*)</code>',
+              raw,
+          )
+          for n in sorted(set(names)):
+              print(n)
+          PY
+          if [[ ! -s current-tools.txt ]]; then
+            echo "::error::Extraction produced zero tool names — extractor may be broken"
+            exit 1
+          fi
+
+      - name: Diff against baseline
+        id: diff
+        run: |
+          if diff -u tests/fixtures/upstream-tools.txt current-tools.txt > /tmp/drift.diff; then
+            echo "Baseline matches upstream — no drift."
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+            echo "### Drift detected" >> "$GITHUB_STEP_SUMMARY"
+            echo '```diff' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/drift.diff >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Ensure label exists
+        if: steps.diff.outputs.drift == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create upstream-drift \
+            --repo "${{ github.repository }}" \
+            --color "fbca04" \
+            --description "Upstream Inderes MCP tool list has drifted from our baseline" \
+            2>/dev/null || true
+
+      - name: File or update drift issue
+        if: steps.diff.outputs.drift == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Build the issue body once; reuse for both create and comment paths.
+          {
+            echo "Upstream [tool list](https://mcp.inderes.com/docs/tools) no longer matches the checked-in baseline (\`tests/fixtures/upstream-tools.txt\`)."
+            echo ""
+            echo "### Diff"
+            echo ""
+            echo '```diff'
+            cat /tmp/drift.diff
+            echo '```'
+            echo ""
+            echo "### Review checklist"
+            echo ""
+            echo "- [ ] Identify which tools were added / removed / renamed"
+            echo "- [ ] Update friendly subcommands in \`src/commands.rs\` if a wrapped tool changed"
+            echo "- [ ] Update skill bodies in \`src/skill/{openclaw,hermes,ptrclaw}.md\` if referenced tool names changed"
+            echo "- [ ] Bump version (calver), update baseline: \`cp current-tools.txt tests/fixtures/upstream-tools.txt\`"
+            echo ""
+            echo "<sub>Posted by \`.github/workflows/upstream-drift.yml\` run [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).</sub>"
+          } > /tmp/issue-body.md
+
+          existing=$(gh issue list --repo "${{ github.repository }}" \
+            --state open --label upstream-drift \
+            --json number --jq '.[0].number')
+
+          if [[ -n "$existing" ]]; then
+            gh issue comment "$existing" \
+              --repo "${{ github.repository }}" \
+              --body-file /tmp/issue-body.md
+            echo "Commented on existing issue #$existing"
+          else
+            gh issue create \
+              --repo "${{ github.repository }}" \
+              --title "Upstream MCP tool list drift detected" \
+              --label upstream-drift \
+              --body-file /tmp/issue-body.md
+          fi

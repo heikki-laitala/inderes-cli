@@ -69,7 +69,10 @@ impl McpClient {
     }
 
     /// Send `initialize` + `notifications/initialized`. Must be called once
-    /// before any other request.
+    /// before any other request. Emits a warning to stderr if the server
+    /// advertises a different `protocolVersion` than we're pinned to — that's
+    /// usually benign (MCP is backwards-compatible within minor revisions)
+    /// but worth a signal so users know to consider upgrading.
     pub async fn initialize(&mut self) -> Result<Value> {
         let params = json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -80,6 +83,14 @@ impl McpClient {
             },
         });
         let server_info = self.request("initialize", params).await?;
+        if let Some(server_version) = server_info.get("protocolVersion").and_then(|v| v.as_str()) {
+            if server_version != MCP_PROTOCOL_VERSION {
+                tracing::warn!(
+                    "MCP server advertises protocol version {server_version}, client pinned to {MCP_PROTOCOL_VERSION}. \
+                     Some features may be degraded; check for an inderes-cli update."
+                );
+            }
+        }
         self.notify("notifications/initialized", json!({})).await?;
         Ok(server_info)
     }

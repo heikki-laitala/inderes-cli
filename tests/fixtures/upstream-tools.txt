@@ -1,0 +1,16 @@
+get-content
+get-document
+get-forum-posts
+get-fundamentals
+get-inderes-estimates
+get-model-portfolio-content
+get-model-portfolio-price
+get-transcript
+list-calendar-events
+list-company-documents
+list-content
+list-insider-transactions
+list-transcripts
+read-document-sections
+search-companies
+search-forum-topics
