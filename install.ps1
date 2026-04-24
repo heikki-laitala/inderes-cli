@@ -42,28 +42,61 @@ if ($version -eq "latest") {
 }
 
 $archive  = "inderes-$target.zip"
-$url      = "https://github.com/$repo/releases/download/$version/$archive"
-$sumUrl   = "$url.sha256"
+
+# Choose asset URLs. On private repos the user-facing github.com/.../download/
+# URL 404s even with a Bearer token — the only reliable authenticated path is
+# via the API with the asset's numeric id. Public repos work either way; we
+# switch on whether GH_TOKEN is set.
+$archiveHeaders = @{ "User-Agent" = "inderes-install.ps1" }
+if ($env:GH_TOKEN) {
+    $archiveHeaders["Authorization"] = "Bearer $($env:GH_TOKEN)"
+
+    Log "Resolving asset IDs for $version"
+    try {
+        $rel = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$repo/releases/tags/$version"
+    } catch {
+        Die "could not read release metadata for $version: $($_.Exception.Message)"
+    }
+    $archiveAsset = $rel.assets | Where-Object { $_.name -eq $archive } | Select-Object -First 1
+    $sumsAsset    = $rel.assets | Where-Object { $_.name -eq "SHA256SUMS" } | Select-Object -First 1
+    if (-not $archiveAsset) { Die "asset $archive not found in release $version" }
+    $url    = "https://api.github.com/repos/$repo/releases/assets/$($archiveAsset.id)"
+    $sumUrl = if ($sumsAsset) { "https://api.github.com/repos/$repo/releases/assets/$($sumsAsset.id)" } else { $null }
+    $archiveHeaders["Accept"] = "application/octet-stream"
+} else {
+    $url    = "https://github.com/$repo/releases/download/$version/$archive"
+    $sumUrl = "https://github.com/$repo/releases/download/$version/SHA256SUMS"
+}
 
 $tmp = New-Item -ItemType Directory -Force -Path (Join-Path $env:TEMP ("inderes-install-" + [System.Guid]::NewGuid().ToString("N")))
 try {
     Log "Downloading $archive ($version)"
     try {
-        Invoke-WebRequest -Headers $headers -Uri $url -OutFile (Join-Path $tmp.FullName $archive) -UseBasicParsing
+        Invoke-WebRequest -Headers $archiveHeaders -Uri $url -OutFile (Join-Path $tmp.FullName $archive) -UseBasicParsing
     } catch {
         Die "download failed: $url — $($_.Exception.Message)"
     }
 
     Log "Verifying checksum"
-    try {
-        Invoke-WebRequest -Headers $headers -Uri $sumUrl -OutFile (Join-Path $tmp.FullName "$archive.sha256") -UseBasicParsing
-        $expected = ((Get-Content (Join-Path $tmp.FullName "$archive.sha256") -Raw).Trim() -split '\s+')[0].ToLower()
-        $actual   = (Get-FileHash -Algorithm SHA256 (Join-Path $tmp.FullName $archive)).Hash.ToLower()
-        if ($expected -ne $actual) {
-            Die "checksum mismatch ($expected vs $actual) — refusing to install"
+    $verified = $false
+    if ($sumUrl) {
+        try {
+            Invoke-WebRequest -Headers $archiveHeaders -Uri $sumUrl -OutFile (Join-Path $tmp.FullName "SHA256SUMS") -UseBasicParsing
+            $sumLine = Select-String -Path (Join-Path $tmp.FullName "SHA256SUMS") -Pattern "\s$([Regex]::Escape($archive))$" | Select-Object -First 1
+            if ($sumLine) {
+                $expected = ($sumLine.Line.Trim() -split '\s+')[0].ToLower()
+                $actual   = (Get-FileHash -Algorithm SHA256 (Join-Path $tmp.FullName $archive)).Hash.ToLower()
+                if ($expected -ne $actual) {
+                    Die "checksum mismatch ($expected vs $actual) — refusing to install"
+                }
+                $verified = $true
+            }
+        } catch {
+            # fall through to warning
         }
-    } catch {
-        Warn "no .sha256 file found at $sumUrl — skipping verification"
+    }
+    if (-not $verified) {
+        Warn "SHA256SUMS not available or $archive not listed — skipping verification"
     }
 
     Log "Extracting"

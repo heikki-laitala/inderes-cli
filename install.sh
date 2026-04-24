@@ -56,21 +56,66 @@ if [[ "$VERSION" == "latest" ]]; then
 fi
 
 archive="inderes-${target}.tar.gz"
-url="https://github.com/${REPO}/releases/download/${VERSION}/${archive}"
-sum_url="${url}.sha256"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# Choose asset URLs. On private repos the user-facing github.com/.../download/
+# URL 404s even with a Bearer token — the only reliable authenticated path is
+# via the API with the asset's numeric id. For public repos the github.com
+# URL works without auth. We switch on whether GH_TOKEN is set.
+asset_accept=()
+if [[ -n "${GH_TOKEN:-}" ]]; then
+  log "Resolving asset IDs for $VERSION"
+  release_meta="$(curl -fsSL "${curl_auth[@]}" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$REPO/releases/tags/$VERSION")" \
+    || die "could not read release metadata for $VERSION"
+
+  # Find the numeric "id" of the asset whose "name" equals the given arg.
+  # Works on pretty-printed GitHub API JSON where each key is on its own line.
+  lookup_asset_id() {
+    printf '%s\n' "$release_meta" | awk -v want="$1" '
+      /"id":[[:space:]]*[0-9]+/ {
+        last_id = $0
+        gsub(/[^0-9]/, "", last_id)
+      }
+      /"name":[[:space:]]*"/ {
+        line = $0
+        sub(/.*"name":[[:space:]]*"/, "", line)
+        sub(/".*/, "", line)
+        if (line == want) { print last_id; exit }
+      }
+    '
+  }
+  archive_id="$(lookup_asset_id "$archive")"
+  sums_id="$(lookup_asset_id "SHA256SUMS")"
+  [[ -n "$archive_id" ]] || die "asset $archive not found in release $VERSION"
+  archive_url="https://api.github.com/repos/$REPO/releases/assets/$archive_id"
+  sums_url=""
+  [[ -n "$sums_id" ]] && sums_url="https://api.github.com/repos/$REPO/releases/assets/$sums_id"
+  asset_accept+=(-H "Accept: application/octet-stream")
+else
+  archive_url="https://github.com/${REPO}/releases/download/${VERSION}/${archive}"
+  sums_url="https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS"
+fi
+
 log "Downloading $archive ($VERSION)"
-curl -fsSL "${curl_auth[@]}" -o "$tmp/$archive" "$url" || die "download failed: $url"
+curl -fsSL "${curl_auth[@]}" "${asset_accept[@]}" -o "$tmp/$archive" "$archive_url" \
+  || die "download failed: $archive_url"
 
 log "Verifying checksum"
-if curl -fsSL "${curl_auth[@]}" -o "$tmp/$archive.sha256" "$sum_url" 2>/dev/null; then
-  (cd "$tmp" && shasum -a 256 -c "$archive.sha256") \
-    || die "checksum mismatch — refusing to install"
+if [[ -n "$sums_url" ]] && \
+   curl -fsSL "${curl_auth[@]}" "${asset_accept[@]}" -o "$tmp/SHA256SUMS" "$sums_url" 2>/dev/null; then
+  sum_line="$(grep -E "[[:space:]]${archive}\$" "$tmp/SHA256SUMS" || true)"
+  if [[ -n "$sum_line" ]]; then
+    (cd "$tmp" && printf '%s\n' "$sum_line" | shasum -a 256 -c -) \
+      || die "checksum mismatch — refusing to install"
+  else
+    warn "$archive not listed in SHA256SUMS — skipping verification"
+  fi
 else
-  warn "no .sha256 file found at $sum_url — skipping verification"
+  warn "SHA256SUMS not available — skipping verification"
 fi
 
 log "Extracting"
