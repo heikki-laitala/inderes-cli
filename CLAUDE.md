@@ -41,6 +41,7 @@ Always run lint and tests before creating commits or PRs:
 cargo fmt                              # format code
 cargo clippy --all-targets -- -D warnings   # lint (must pass clean)
 cargo test --all-targets               # unit + integration tests
+npx -y markdownlint-cli2@0.22.1        # markdown lint (uses .markdownlint-cli2.jsonc)
 ```
 
 ## Conventions

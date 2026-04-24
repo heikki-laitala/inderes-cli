@@ -1,0 +1,21 @@
+{
+  // Project markdown, excluding dependency-installed noise.
+  "globs": ["**/*.md"],
+  "ignores": [
+    "**/node_modules/**",
+    "target/**"
+  ],
+  "config": {
+    "default": true,
+    // Long-form prose is better read unwrapped on GitHub/IDEs.
+    "MD013": false,
+    // Our prose emphasises key terms with bold that isn't a heading.
+    "MD036": false,
+    // Code fences without a language tag are fine (e.g. ascii diagrams).
+    "MD040": false,
+    // README and SKILL.md start with a YAML frontmatter block, not an H1.
+    "MD041": false,
+    // Our table style is the default; no need to enforce "compact" vs "extended".
+    "MD060": false
+  }
+}

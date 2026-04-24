@@ -40,3 +40,17 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --release
+
+  docs:
+    name: markdownlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Lint markdown
+        run: npx -y markdownlint-cli2@0.22.1
