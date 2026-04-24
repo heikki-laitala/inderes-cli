@@ -1,0 +1,150 @@
+name: E2E (skill loaders)
+
+# Verifies each supported host agent can parse our installed SKILL.md and
+# that the `inderes` binary is callable through its runtime. No network, no
+# OAuth, no LLM — just skill-parse + subprocess-spawn shape checks.
+#
+# Gated on changes that can break host integration, plus a weekly cron to
+# catch upstream format drift.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/skill/**"
+      - "src/skill.rs"
+      - "src/commands.rs"
+      - "src/main.rs"
+      - "tests/e2e/**"
+      - ".github/workflows/e2e.yml"
+  pull_request:
+    paths:
+      - "src/skill/**"
+      - "src/skill.rs"
+      - "src/commands.rs"
+      - "src/main.rs"
+      - "tests/e2e/**"
+      - ".github/workflows/e2e.yml"
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+env:
+  # Pinned host SHAs. Bump deliberately; unpinned `main` would introduce
+  # non-deterministic CI failures caused by unrelated upstream changes.
+  OPENCLAW_SHA: 8f64cd3e4d8339a6aab3ca230d5e14944c91cfaf
+  HERMES_SHA: 62c14d5513469e27474fc9535fcdd4afa016646f
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-inderes:
+    name: Build inderes binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e-inderes
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: inderes-linux
+          path: target/release/inderes
+          retention-days: 1
+          if-no-files-found: error
+
+  openclaw:
+    name: OpenClaw skill loader
+    needs: build-inderes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout inderes-cli
+        uses: actions/checkout@v6
+
+      - name: Checkout openclaw at pinned SHA
+        uses: actions/checkout@v6
+        with:
+          repository: openclaw/openclaw
+          ref: ${{ env.OPENCLAW_SHA }}
+          path: .host/openclaw
+
+      - name: Download inderes binary
+        uses: actions/download-artifact@v8
+        with:
+          name: inderes-linux
+          path: .bin
+      - run: chmod +x .bin/inderes
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10"
+          run_install: false
+
+      - name: Install OpenClaw root deps
+        working-directory: .host/openclaw
+        run: pnpm install --filter . --prefer-offline --ignore-scripts
+
+      - name: Install validator deps
+        working-directory: tests/e2e/openclaw
+        run: npm install --no-audit --no-fund
+
+      - name: Run OpenClaw validator
+        working-directory: tests/e2e/openclaw
+        env:
+          OPENCLAW_DIR: ${{ github.workspace }}/.host/openclaw
+          INDERES_BIN: ${{ github.workspace }}/.bin/inderes
+        run: ./node_modules/.bin/tsx validate.mts
+
+  hermes:
+    name: Hermes skill loader
+    needs: build-inderes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout inderes-cli
+        uses: actions/checkout@v6
+
+      - name: Checkout hermes-agent at pinned SHA
+        uses: actions/checkout@v6
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ env.HERMES_SHA }}
+          path: .host/hermes
+
+      - name: Download inderes binary
+        uses: actions/download-artifact@v8
+        with:
+          name: inderes-linux
+          path: .bin
+      - run: chmod +x .bin/inderes
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Hermes (minimal)
+        working-directory: .host/hermes
+        # Base install is enough — we only need agent.* and tools.* modules.
+        # No [all] extras (voice, modal, etc.) because we don't exercise them.
+        run: pip install -e .
+
+      - name: Run Hermes validator
+        env:
+          HERMES_DIR: ${{ github.workspace }}/.host/hermes
+          INDERES_BIN: ${{ github.workspace }}/.bin/inderes
+        run: python3 tests/e2e/hermes/validate.py

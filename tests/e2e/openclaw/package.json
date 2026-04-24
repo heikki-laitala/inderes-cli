@@ -1,0 +1,9 @@
+{
+  "name": "inderes-cli-e2e-openclaw",
+  "private": true,
+  "type": "module",
+  "description": "E2E validator: feed our openclaw.md through OpenClaw's own skill loader.",
+  "devDependencies": {
+    "tsx": "^4.21.0"
+  }
+}

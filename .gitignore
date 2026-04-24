@@ -7,6 +7,12 @@ tokens.json
 .env
 .env.local
 
+# E2E test dependencies (installed on demand, reproducible)
+tests/e2e/**/node_modules/
+tests/e2e/**/package-lock.json
+tests/e2e/**/__pycache__/
+tests/e2e/**/*.pyc
+
 # Editor / OS noise
 .DS_Store
 .idea/
