@@ -16,16 +16,16 @@ use serde_json::{json, Map, Value};
 
 use crate::auth;
 use crate::mcp::McpClient;
-use crate::oauth;
+use crate::oauth::{self, IdpConfig};
 use crate::skill;
 use crate::storage;
 
 // --- login / logout / whoami ------------------------------------------------
 
-pub async fn login(http: &reqwest::Client, no_browser: bool) -> Result<()> {
-    let tokens = oauth::login(http, oauth::DEFAULT_SCOPES, !no_browser).await?;
+pub async fn login(http: &reqwest::Client, idp: &IdpConfig, no_browser: bool) -> Result<()> {
+    let tokens = oauth::login(http, idp, oauth::DEFAULT_SCOPES, !no_browser).await?;
     storage::save(&tokens)?;
-    let ui = oauth::userinfo(http, &tokens.access_token).await.ok();
+    let ui = oauth::userinfo(http, idp, &tokens.access_token).await.ok();
     let who = ui
         .as_ref()
         .and_then(|v| v.get("preferred_username").and_then(|s| s.as_str()))
@@ -44,7 +44,7 @@ pub fn logout() -> Result<()> {
     Ok(())
 }
 
-pub async fn whoami(http: &reqwest::Client, verbose: bool) -> Result<()> {
+pub async fn whoami(http: &reqwest::Client, idp: &IdpConfig, verbose: bool) -> Result<()> {
     let Some(tokens) = auth::load_stored()? else {
         println!("Not signed in. Run `inderes login`.");
         return Ok(());
@@ -57,7 +57,7 @@ pub async fn whoami(http: &reqwest::Client, verbose: bool) -> Result<()> {
     }
     if verbose {
         println!("Storage: {}", storage::backend_description());
-        match oauth::userinfo(http, &tokens.access_token).await {
+        match oauth::userinfo(http, idp, &tokens.access_token).await {
             Ok(ui) => println!("{}", serde_json::to_string_pretty(&ui)?),
             Err(e) => eprintln!("userinfo call failed: {e:#}"),
         }
@@ -70,12 +70,13 @@ pub async fn whoami(http: &reqwest::Client, verbose: bool) -> Result<()> {
 pub struct ToolCtx<'a> {
     pub http: &'a reqwest::Client,
     pub endpoint: &'a str,
+    pub idp: &'a IdpConfig,
     pub json_output: bool,
 }
 
 impl<'a> ToolCtx<'a> {
     async fn client(&self) -> Result<McpClient> {
-        let token = auth::ensure_access_token(self.http).await?;
+        let token = auth::ensure_access_token(self.http, self.idp).await?;
         let mut c = McpClient::new(self.http.clone(), self.endpoint, token);
         c.initialize().await.context("initializing MCP session")?;
         Ok(c)
@@ -315,35 +316,92 @@ fn print_result(result: &Value, as_json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(result)?);
         return Ok(());
     }
-    // MCP tool results typically look like:
-    //   { "content": [ { "type": "text", "text": "..." }, ... ], "isError": false }
-    // Surface the concatenated `text` bodies; fall back to JSON on anything
-    // we don't recognize.
-    if let Some(content) = result.get("content").and_then(|v| v.as_array()) {
-        let mut printed_any = false;
-        for item in content {
-            match item.get("type").and_then(|v| v.as_str()) {
-                Some("text") => {
-                    if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
-                        println!("{t}");
-                        printed_any = true;
-                    }
-                }
-                Some(other) => {
-                    eprintln!("<{other} content omitted; re-run with --json to inspect>");
-                }
-                None => {}
-            }
-        }
-        if !printed_any && content.is_empty() {
-            println!("(empty result)");
-        }
-        if let Some(true) = result.get("isError").and_then(|v| v.as_bool()) {
-            bail!("tool returned isError=true");
-        }
+    let mut stdout = io::stdout().lock();
+    render_result(result, &mut stdout)?;
+    if let Some(true) = result.get("isError").and_then(|v| v.as_bool()) {
+        bail!("tool returned isError=true");
+    }
+    Ok(())
+}
+
+/// Renders MCP `{content: [...]}` into a human-friendly stream. Text content
+/// passes through verbatim; non-text content types (image/audio/resource)
+/// become single-line placeholders so nobody accidentally streams binary
+/// base64 to their terminal, but enough detail is preserved to identify the
+/// asset and fall back to `--json` if needed.
+pub(crate) fn render_result(result: &Value, out: &mut dyn io::Write) -> io::Result<()> {
+    let Some(content) = result.get("content").and_then(|v| v.as_array()) else {
+        writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(result).unwrap_or_default()
+        )?;
+        return Ok(());
+    };
+    if content.is_empty() {
+        writeln!(out, "(empty result)")?;
         return Ok(());
     }
-    println!("{}", serde_json::to_string_pretty(result)?);
+    for item in content {
+        render_content_item(item, out)?;
+    }
+    Ok(())
+}
+
+fn render_content_item(item: &Value, out: &mut dyn io::Write) -> io::Result<()> {
+    match item.get("type").and_then(|v| v.as_str()) {
+        Some("text") => {
+            if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                writeln!(out, "{t}")?;
+            }
+        }
+        Some("image") => {
+            let mime = item.get("mimeType").and_then(|v| v.as_str()).unwrap_or("?");
+            let bytes_b64 = item
+                .get("data")
+                .and_then(|v| v.as_str())
+                .map(str::len)
+                .unwrap_or(0);
+            writeln!(
+                out,
+                "[image: {mime}, {bytes_b64} bytes base64 — pass --json for raw data]"
+            )?;
+        }
+        Some("audio") => {
+            let mime = item.get("mimeType").and_then(|v| v.as_str()).unwrap_or("?");
+            let bytes_b64 = item
+                .get("data")
+                .and_then(|v| v.as_str())
+                .map(str::len)
+                .unwrap_or(0);
+            writeln!(
+                out,
+                "[audio: {mime}, {bytes_b64} bytes base64 — pass --json for raw data]"
+            )?;
+        }
+        Some("resource") => {
+            let empty = Value::Null;
+            let resource = item.get("resource").unwrap_or(&empty);
+            let uri = resource.get("uri").and_then(|v| v.as_str()).unwrap_or("?");
+            let mime = resource.get("mimeType").and_then(|v| v.as_str());
+            if let Some(text) = resource.get("text").and_then(|v| v.as_str()) {
+                writeln!(
+                    out,
+                    "[resource: {uri}{}]",
+                    mime.map(|m| format!(", {m}")).unwrap_or_default()
+                )?;
+                writeln!(out, "{text}")?;
+            } else if resource.get("blob").is_some() {
+                writeln!(out, "[resource: {uri} (binary) — pass --json for raw data]")?;
+            } else {
+                writeln!(out, "[resource: {uri}]")?;
+            }
+        }
+        Some(other) => {
+            writeln!(out, "[{other} content — pass --json for raw output]")?;
+        }
+        None => {}
+    }
     Ok(())
 }
 

@@ -32,17 +32,63 @@ use url::Url;
 
 use crate::storage::Tokens;
 
-pub const CLIENT_ID: &str = "inderes-mcp";
-pub const AUTH_URL: &str =
+const DEFAULT_CLIENT_ID: &str = "inderes-mcp";
+const DEFAULT_AUTH_URL: &str =
     "https://sso.inderes.fi/auth/realms/Inderes/protocol/openid-connect/auth";
-pub const TOKEN_URL: &str =
+const DEFAULT_TOKEN_URL: &str =
     "https://sso.inderes.fi/auth/realms/Inderes/protocol/openid-connect/token";
-pub const USERINFO_URL: &str =
+const DEFAULT_USERINFO_URL: &str =
     "https://sso.inderes.fi/auth/realms/Inderes/protocol/openid-connect/userinfo";
 pub const DEFAULT_SCOPES: &[&str] = &["openid", "offline_access", "profile", "email"];
 
+/// All Keycloak endpoints + client info in one place, so pointing at a
+/// staging realm or a self-hosted IdP only needs a few env vars instead of
+/// a recompile.
+#[derive(Debug, Clone)]
+pub struct IdpConfig {
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub userinfo_endpoint: String,
+    pub client_id: String,
+}
+
+impl IdpConfig {
+    /// The baked-in Inderes production realm.
+    pub fn inderes_default() -> Self {
+        Self {
+            authorization_endpoint: DEFAULT_AUTH_URL.into(),
+            token_endpoint: DEFAULT_TOKEN_URL.into(),
+            userinfo_endpoint: DEFAULT_USERINFO_URL.into(),
+            client_id: DEFAULT_CLIENT_ID.into(),
+        }
+    }
+
+    /// Start from the Inderes defaults, then apply any env-var overrides.
+    pub fn from_env() -> Self {
+        let mut cfg = Self::inderes_default();
+        if let Ok(v) = std::env::var("INDERES_IDP_AUTH_URL") {
+            cfg.authorization_endpoint = v;
+        }
+        if let Ok(v) = std::env::var("INDERES_IDP_TOKEN_URL") {
+            cfg.token_endpoint = v;
+        }
+        if let Ok(v) = std::env::var("INDERES_IDP_USERINFO_URL") {
+            cfg.userinfo_endpoint = v;
+        }
+        if let Ok(v) = std::env::var("INDERES_IDP_CLIENT_ID") {
+            cfg.client_id = v;
+        }
+        cfg
+    }
+}
+
 /// Run the interactive login flow, returning freshly-minted tokens.
-pub async fn login(http: &reqwest::Client, scopes: &[&str], open_browser: bool) -> Result<Tokens> {
+pub async fn login(
+    http: &reqwest::Client,
+    idp: &IdpConfig,
+    scopes: &[&str],
+    open_browser: bool,
+) -> Result<Tokens> {
     let verifier = random_verifier();
     let challenge = pkce_s256(&verifier);
     let state = random_urlsafe(24);
@@ -53,7 +99,7 @@ pub async fn login(http: &reqwest::Client, scopes: &[&str], open_browser: bool) 
     let addr: SocketAddr = listener.local_addr()?;
     let redirect_uri = format!("http://127.0.0.1:{}/callback", addr.port());
 
-    let auth_url = build_auth_url(&redirect_uri, &challenge, &state, scopes)?;
+    let auth_url = build_auth_url(idp, &redirect_uri, &challenge, &state, scopes)?;
 
     eprintln!("Opening browser to sign in with your Inderes account…");
     eprintln!("If the browser does not open, visit this URL:\n  {auth_url}");
@@ -79,26 +125,34 @@ pub async fn login(http: &reqwest::Client, scopes: &[&str], open_browser: bool) 
         Err(_) => bail!("login timed out after 5 minutes"),
     };
 
-    let tokens = exchange_code(http, &code, &redirect_uri, &verifier).await?;
+    let tokens = exchange_code(http, idp, &code, &redirect_uri, &verifier).await?;
     Ok(tokens)
 }
 
 /// Refresh an access token using the stored refresh token. Returns new tokens
 /// (the refresh token itself may rotate).
-pub async fn refresh(http: &reqwest::Client, refresh_token: &str) -> Result<Tokens> {
+pub async fn refresh(
+    http: &reqwest::Client,
+    idp: &IdpConfig,
+    refresh_token: &str,
+) -> Result<Tokens> {
     let params = [
         ("grant_type", "refresh_token"),
-        ("client_id", CLIENT_ID),
+        ("client_id", idp.client_id.as_str()),
         ("refresh_token", refresh_token),
     ];
-    post_token(http, &params).await
+    post_token(http, idp, &params).await
 }
 
 /// Call Keycloak `/userinfo` with the current access token. Useful for
 /// `inderes whoami`.
-pub async fn userinfo(http: &reqwest::Client, access_token: &str) -> Result<serde_json::Value> {
+pub async fn userinfo(
+    http: &reqwest::Client,
+    idp: &IdpConfig,
+    access_token: &str,
+) -> Result<serde_json::Value> {
     let resp = http
-        .get(USERINFO_URL)
+        .get(&idp.userinfo_endpoint)
         .bearer_auth(access_token)
         .send()
         .await
@@ -114,15 +168,16 @@ pub async fn userinfo(http: &reqwest::Client, access_token: &str) -> Result<serd
 // --- internals --------------------------------------------------------------
 
 fn build_auth_url(
+    idp: &IdpConfig,
     redirect_uri: &str,
     code_challenge: &str,
     state: &str,
     scopes: &[&str],
 ) -> Result<Url> {
-    let mut u = Url::parse(AUTH_URL)?;
+    let mut u = Url::parse(&idp.authorization_endpoint)?;
     u.query_pairs_mut()
         .append_pair("response_type", "code")
-        .append_pair("client_id", CLIENT_ID)
+        .append_pair("client_id", &idp.client_id)
         .append_pair("redirect_uri", redirect_uri)
         .append_pair("scope", &scopes.join(" "))
         .append_pair("state", state)
@@ -133,18 +188,19 @@ fn build_auth_url(
 
 async fn exchange_code(
     http: &reqwest::Client,
+    idp: &IdpConfig,
     code: &str,
     redirect_uri: &str,
     verifier: &str,
 ) -> Result<Tokens> {
     let params = [
         ("grant_type", "authorization_code"),
-        ("client_id", CLIENT_ID),
+        ("client_id", idp.client_id.as_str()),
         ("code", code),
         ("redirect_uri", redirect_uri),
         ("code_verifier", verifier),
     ];
-    post_token(http, &params).await
+    post_token(http, idp, &params).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,9 +220,13 @@ struct TokenResponse {
     error_description: Option<String>,
 }
 
-async fn post_token(http: &reqwest::Client, params: &[(&str, &str)]) -> Result<Tokens> {
+async fn post_token(
+    http: &reqwest::Client,
+    idp: &IdpConfig,
+    params: &[(&str, &str)],
+) -> Result<Tokens> {
     let resp = http
-        .post(TOKEN_URL)
+        .post(&idp.token_endpoint)
         .form(params)
         .send()
         .await

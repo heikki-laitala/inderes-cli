@@ -220,16 +220,18 @@ async fn run() -> Result<()> {
         .endpoint
         .clone()
         .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+    let idp = oauth::IdpConfig::from_env();
     let ctx = commands::ToolCtx {
         http: &http,
         endpoint: &endpoint,
+        idp: &idp,
         json_output: cli.json,
     };
 
     match cli.command {
-        Command::Login { no_browser } => commands::login(&http, no_browser).await,
+        Command::Login { no_browser } => commands::login(&http, &idp, no_browser).await,
         Command::Logout => commands::logout(),
-        Command::Whoami => commands::whoami(&http, cli.verbose > 0).await,
+        Command::Whoami => commands::whoami(&http, &idp, cli.verbose > 0).await,
 
         Command::Search { query } => commands::search(&ctx, &query).await,
         Command::Fundamentals {

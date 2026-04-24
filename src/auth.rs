@@ -3,6 +3,7 @@
 
 use anyhow::{bail, Context, Result};
 
+use crate::oauth::IdpConfig;
 use crate::storage::Tokens;
 use crate::{oauth, storage};
 
@@ -11,7 +12,7 @@ const EXPIRY_SKEW_SECS: i64 = 30;
 /// Return a fresh access token string. Refreshes if needed. If no tokens are
 /// stored or refresh fails, returns an error instructing the user to run
 /// `inderes login`.
-pub async fn ensure_access_token(http: &reqwest::Client) -> Result<String> {
+pub async fn ensure_access_token(http: &reqwest::Client, idp: &IdpConfig) -> Result<String> {
     let tokens = storage::load()?
         .ok_or_else(|| anyhow::anyhow!("not signed in — run `inderes login` first"))?;
 
@@ -23,7 +24,7 @@ pub async fn ensure_access_token(http: &reqwest::Client) -> Result<String> {
         bail!("access token expired and no refresh token stored — run `inderes login`");
     };
 
-    let fresh = oauth::refresh(http, &rt)
+    let fresh = oauth::refresh(http, idp, &rt)
         .await
         .context("refreshing access token (try `inderes login` if this persists)")?;
     storage::save(&fresh)?;

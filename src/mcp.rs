@@ -10,15 +10,32 @@
 //! one request (e.g. `tools/list` or `tools/call`) → done. Session IDs are
 //! honoured if the server issues them.
 
+use std::time::Duration;
+
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE};
+use reqwest::StatusCode;
 use serde_json::{json, Value};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 const CLIENT_NAME: &str = "inderes-cli";
 const SESSION_HEADER: &str = "Mcp-Session-Id";
 const PROTOCOL_HEADER: &str = "MCP-Protocol-Version";
+
+/// Max number of attempts including the initial one. Three retries on top
+/// of the original request is enough to ride out a short-lived upstream
+/// blip without masking a real outage.
+const MAX_ATTEMPTS: u32 = 4;
+const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_BACKOFF: Duration = Duration::from_millis(4000);
+
+/// HTTP statuses worth retrying: rate-limit + canonical transient gateway
+/// errors. 500 is deliberately excluded — a 500 from an MCP server usually
+/// means application-level badness that a retry won't fix.
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 429 | 502 | 503 | 504)
+}
 
 pub struct McpClient {
     http: reqwest::Client,
@@ -161,7 +178,43 @@ impl McpClient {
         Ok(())
     }
 
+    /// POST with exponential backoff on transient failures. Retriable cases:
+    /// transport-level errors (connect/TLS/DNS) from `reqwest::send()`, and
+    /// HTTP statuses in `is_retryable_status`. Non-retriable statuses
+    /// (4xx except 429, 5xx except 502/503/504) return immediately so we
+    /// don't mask real errors.
     async fn post(&self, body: &Value) -> Result<reqwest::Response> {
+        let mut delay = INITIAL_BACKOFF;
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.post_once(body).await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() || !is_retryable_status(status) {
+                        return Ok(resp);
+                    }
+                    tracing::warn!(
+                        "MCP {status} on attempt {attempt}/{MAX_ATTEMPTS}; retrying in {:?}",
+                        delay
+                    );
+                    last_err = Some(anyhow!("MCP upstream returned {status}"));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "MCP transport error on attempt {attempt}/{MAX_ATTEMPTS}: {e:#}"
+                    );
+                    last_err = Some(e);
+                }
+            }
+            if attempt < MAX_ATTEMPTS {
+                tokio::time::sleep(delay).await;
+                delay = std::cmp::min(delay * 2, MAX_BACKOFF);
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("MCP request failed after {MAX_ATTEMPTS} attempts")))
+    }
+
+    async fn post_once(&self, body: &Value) -> Result<reqwest::Response> {
         let mut headers = HeaderMap::new();
         headers.insert(
             ACCEPT,
