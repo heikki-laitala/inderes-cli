@@ -64,6 +64,29 @@ Opens your default browser and signs you in with your Inderes account via OAuth 
 
 If the redirect fails with "Invalid redirect URI", follow the guidance in the [Inderes MCP setup docs](https://mcp.inderes.com/docs/setup) and email `support@inderes.fi` with the client name `inderes-mcp` and the exact error URL.
 
+### Headless / SSH / agent flow
+
+The default `inderes login` binds a loopback HTTP listener for the OAuth callback. That fails when you're on a machine without a browser and the actual user is elsewhere — typical scenarios:
+
+- SSH'd into a remote box; browser is on your laptop
+- Running inside Docker without port forwarding
+- Driven by an agent (OpenClaw, Hermes, ptrclaw) that doesn't have a graphical session
+
+Use `--paste-callback` for those:
+
+```bash
+inderes login --paste-callback
+```
+
+The CLI prints the auth URL, you open it in any browser on any machine, sign in, and your browser tries to redirect to a localhost URL — which will show "unable to connect" because no listener is running. **That's expected.** Copy the full URL from your browser's address bar (it looks like `http://127.0.0.1:46233/callback?state=…&code=…`) and paste it back to the CLI's prompt. The CLI extracts the `code`, validates `state`, and exchanges it for tokens just like the loopback flow.
+
+For agent integrations: the CLI prints the auth URL to stderr and reads the pasted URL from stdin, so an agent driving `inderes login --paste-callback` as a subprocess can:
+
+1. Read stderr to surface the auth URL to the user.
+2. Capture the user's pasted URL through whatever UI the agent uses.
+3. Write that URL plus a newline to the subprocess's stdin.
+4. Wait for the subprocess to exit successfully — tokens are now stored.
+
 ## Usage
 
 ```bash

@@ -82,8 +82,37 @@ impl IdpConfig {
     }
 }
 
+/// How the OAuth callback is collected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginMode {
+    /// Bind a loopback HTTP listener and wait for the browser to redirect
+    /// to it. Default for desktop installs.
+    Loopback,
+    /// Print the auth URL and read the resulting callback URL from stdin.
+    /// For SSH sessions, Docker containers, or agent flows where no
+    /// loopback listener can reach the user's browser.
+    PasteCallback,
+}
+
 /// Run the interactive login flow, returning freshly-minted tokens.
 pub async fn login(
+    http: &reqwest::Client,
+    idp: &IdpConfig,
+    scopes: &[&str],
+    open_browser: bool,
+    mode: LoginMode,
+) -> Result<Tokens> {
+    match mode {
+        LoginMode::Loopback => login_loopback(http, idp, scopes, open_browser).await,
+        LoginMode::PasteCallback => {
+            let stdin = std::io::stdin();
+            let mut locked = stdin.lock();
+            login_paste(http, idp, scopes, open_browser, &mut locked).await
+        }
+    }
+}
+
+async fn login_loopback(
     http: &reqwest::Client,
     idp: &IdpConfig,
     scopes: &[&str],
@@ -127,6 +156,78 @@ pub async fn login(
 
     let tokens = exchange_code(http, idp, &code, &redirect_uri, &verifier).await?;
     Ok(tokens)
+}
+
+async fn login_paste<R: std::io::BufRead>(
+    http: &reqwest::Client,
+    idp: &IdpConfig,
+    scopes: &[&str],
+    open_browser: bool,
+    input: &mut R,
+) -> Result<Tokens> {
+    let verifier = random_verifier();
+    let challenge = pkce_s256(&verifier);
+    let state = random_urlsafe(24);
+
+    // Discover a free ephemeral port so the redirect URI matches the same
+    // shape Keycloak's `inderes-mcp` client whitelist expects, then drop
+    // the listener immediately — we never accept on it. The user's browser
+    // will fail to reach this socket; the address-bar contents are what we
+    // care about.
+    let port = {
+        let l = TcpListener::bind("127.0.0.1:0")
+            .await
+            .context("picking an ephemeral port for the paste-callback redirect URI")?;
+        l.local_addr()?.port()
+    };
+    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+
+    let auth_url = build_auth_url(idp, &redirect_uri, &challenge, &state, scopes)?;
+
+    eprintln!("Headless sign-in flow:");
+    eprintln!();
+    eprintln!("  1. Open this URL in any browser:");
+    eprintln!();
+    eprintln!("     {auth_url}");
+    eprintln!();
+    eprintln!("  2. Sign in with your Inderes account.");
+    eprintln!("  3. Your browser will redirect to http://127.0.0.1:{port}/callback?...");
+    eprintln!("     and show \"unable to connect\" — that's expected; there is no");
+    eprintln!("     listener on this machine.");
+    eprintln!("  4. Copy the FULL URL from your browser's address bar and paste below.");
+    eprintln!();
+    if open_browser {
+        let _ = webbrowser::open(auth_url.as_str());
+    }
+    eprint!("Callback URL: ");
+
+    let mut line = String::new();
+    input
+        .read_line(&mut line)
+        .context("reading pasted callback URL")?;
+    let pasted = line.trim();
+    if pasted.is_empty() {
+        bail!("no callback URL pasted; aborting login");
+    }
+
+    let code = parse_callback_url(pasted, &state).map_err(|e| anyhow!("{e}"))?;
+    let tokens = exchange_code(http, idp, &code, &redirect_uri, &verifier).await?;
+    Ok(tokens)
+}
+
+/// Pure helper: extract the OAuth `code` from a full callback URL,
+/// validating that `state` matches what we sent. Used by the paste-callback
+/// flow; tests cover the URL shapes we're tolerant of.
+fn parse_callback_url(url_str: &str, expected_state: &str) -> Result<String, String> {
+    let url = Url::parse(url_str).map_err(|e| format!("not a valid URL: {e}"))?;
+    let path = url.path();
+    let query = url.query().unwrap_or("");
+    let path_with_query = if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{query}")
+    };
+    parse_callback_path(&path_with_query, expected_state)
 }
 
 /// Refresh an access token using the stored refresh token. Returns new tokens
@@ -518,6 +619,50 @@ mod tests {
     fn parse_callback_rejects_missing_code() {
         let err = parse_callback_path("/callback?state=s1", "s1").unwrap_err();
         assert!(err.contains("missing `code`"), "got: {err}");
+    }
+
+    // --- parse_callback_url (paste-callback flow) -------------------------
+
+    #[test]
+    fn parse_full_url_extracts_code() {
+        let url = "http://127.0.0.1:46233/callback?state=hPHKdtsM&session_state=a6315808&iss=https%3A%2F%2Fsso.inderes.fi%2Fauth%2Frealms%2FInderes&code=5f5b2f97-fb48-4450-9a00-082f6fb06059";
+        let code = parse_callback_url(url, "hPHKdtsM").unwrap();
+        assert_eq!(code, "5f5b2f97-fb48-4450-9a00-082f6fb06059");
+    }
+
+    #[test]
+    fn parse_full_url_validates_state() {
+        let url = "http://127.0.0.1:1/callback?code=abc&state=wrong";
+        let err = parse_callback_url(url, "expected").unwrap_err();
+        assert!(err.contains("state mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_full_url_rejects_garbage() {
+        let err = parse_callback_url("not a url at all", "s").unwrap_err();
+        assert!(err.contains("not a valid URL"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_full_url_rejects_wrong_path() {
+        let err = parse_callback_url("https://evil.example/?code=x&state=s", "s").unwrap_err();
+        assert!(err.contains("unexpected callback path"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_full_url_handles_https_redirect_uri() {
+        // Some Keycloak realms might redirect via https in tests/staging;
+        // we only care about path+query, scheme and host are ignored.
+        let url = "https://localhost:9999/callback?code=ok&state=s1";
+        let code = parse_callback_url(url, "s1").unwrap();
+        assert_eq!(code, "ok");
+    }
+
+    #[test]
+    fn parse_full_url_surfaces_error_param() {
+        let url = "http://127.0.0.1:1/callback?error=access_denied&error_description=User+abandoned&state=s1";
+        let err = parse_callback_url(url, "s1").unwrap_err();
+        assert!(err.contains("access_denied"));
     }
 
     // --- Token endpoint (wiremock) ----------------------------------------
