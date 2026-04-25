@@ -177,3 +177,29 @@ jobs:
             }
             Get-Content $out -TotalCount 3
           }
+
+  install-sh-latest:
+    # Regression coverage for github.com/heikki-laitala/inderes-cli/issues/9.
+    # The matrix above always passes an explicit INDERES_VERSION, which means
+    # install.sh's `latest` resolution branch (curl -> awk pipeline) was
+    # never exercised in CI. This dedicated job runs install.sh with no
+    # version pinned so the API + parse path runs under `set -euo pipefail`
+    # exactly as a real user invoking `curl … | bash` does.
+    name: install.sh (latest-tag resolution)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run install.sh with no version pinned (defaults to "latest")
+        env:
+          INDERES_INSTALL_DIR: ${{ github.workspace }}/bin
+          # INDERES_VERSION deliberately unset — exercise the latest branch.
+        run: ./install.sh
+
+      - name: Verify --version
+        run: |
+          out="$("${{ github.workspace }}/bin/inderes" --version)"
+          echo "$out"
+          echo "$out" | grep -q '^inderes ' \
+            || { echo "unexpected version output"; exit 1; }

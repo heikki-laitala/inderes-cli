@@ -59,8 +59,15 @@ esac
 
 if [[ "$VERSION" == "latest" ]]; then
   log "Resolving latest release for $REPO"
-  VERSION="$(curl -fsSL ${curl_auth[@]+"${curl_auth[@]}"} "https://api.github.com/repos/$REPO/releases/latest" \
-    | awk -F'"' '/"tag_name":/ {print $4; exit}')"
+  # Fetch first, parse second. Piping curl into `awk '... {exit}'` closes
+  # the pipe before curl finishes writing the body, which under
+  # `set -o pipefail` propagates curl's SIGPIPE (exit 23) and aborts the
+  # whole installer — even though the tag was extracted successfully.
+  # See https://github.com/heikki-laitala/inderes-cli/issues/9.
+  release_json="$(curl -fsSL ${curl_auth[@]+"${curl_auth[@]}"} \
+    "https://api.github.com/repos/$REPO/releases/latest")" \
+    || die "could not query latest release"
+  VERSION="$(printf '%s\n' "$release_json" | awk -F'"' '/"tag_name":/ {print $4; exit}')"
   [[ -n "$VERSION" ]] || die "could not determine latest tag"
 fi
 
