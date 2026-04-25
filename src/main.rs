@@ -54,6 +54,13 @@ enum Command {
         /// Print the auth URL instead of opening a browser.
         #[arg(long)]
         no_browser: bool,
+        /// Don't bind a loopback listener. Print the auth URL, then read
+        /// the full callback URL from stdin once the user has signed in
+        /// in a browser (possibly on a different machine). Use this on
+        /// SSH sessions, Docker containers, or agent flows where no
+        /// listener on this machine can receive the redirect.
+        #[arg(long, conflicts_with = "no_browser")]
+        paste_callback: bool,
     },
     /// Remove stored tokens.
     Logout,
@@ -229,7 +236,10 @@ async fn run() -> Result<()> {
     };
 
     match cli.command {
-        Command::Login { no_browser } => commands::login(&http, &idp, no_browser).await,
+        Command::Login {
+            no_browser,
+            paste_callback,
+        } => commands::login(&http, &idp, no_browser, paste_callback).await,
         Command::Logout => commands::logout(),
         Command::Whoami => commands::whoami(&http, &idp, cli.verbose > 0).await,
 

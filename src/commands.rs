@@ -22,8 +22,18 @@ use crate::storage;
 
 // --- login / logout / whoami ------------------------------------------------
 
-pub async fn login(http: &reqwest::Client, idp: &IdpConfig, no_browser: bool) -> Result<()> {
-    let tokens = oauth::login(http, idp, oauth::DEFAULT_SCOPES, !no_browser).await?;
+pub async fn login(
+    http: &reqwest::Client,
+    idp: &IdpConfig,
+    no_browser: bool,
+    paste_callback: bool,
+) -> Result<()> {
+    let mode = if paste_callback {
+        oauth::LoginMode::PasteCallback
+    } else {
+        oauth::LoginMode::Loopback
+    };
+    let tokens = oauth::login(http, idp, oauth::DEFAULT_SCOPES, !no_browser, mode).await?;
     storage::save(&tokens)?;
     let ui = oauth::userinfo(http, idp, &tokens.access_token).await.ok();
     let who = ui
