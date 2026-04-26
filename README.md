@@ -121,6 +121,28 @@ Every tool-calling subcommand accepts `--json` to emit raw MCP output:
 inderes --json search "Nokia" | jq '.content[0].text'
 ```
 
+## Upgrade
+
+```bash
+inderes upgrade --check-only   # just print current vs latest
+inderes upgrade                # install the latest release in place
+inderes upgrade --force        # re-install even if already on latest
+```
+
+The CLI queries GitHub for the latest tag, compares to the running version, and (if newer or `--force`) shells out to the same `install.sh` / `install.ps1` you'd `curl | bash`. The new binary lands in the same directory the running binary was launched from, so an upgrade preserves the install location regardless of where you originally put it.
+
+`inderes upgrade --check-only` is safe to run from cron or an agent.
+
+## Uninstall
+
+```bash
+inderes uninstall                            # confirms, clears tokens, prints rm hint
+inderes uninstall --yes                      # skip the confirmation prompt
+inderes uninstall --yes --remove-skills      # also delete ~/.<host>/skills/inderes/
+```
+
+`uninstall` clears stored tokens, optionally removes installed skill files, and prints the platform-appropriate command to delete the binary itself. The CLI doesn't self-delete its running executable — that step is left to you because it's the only sane cross-platform answer (Unix permits it; Windows requires a workaround that has its own footguns).
+
 ## Install the skill
 
 The `inderes` binary is designed to be invoked by an agent through an on-demand skill — keeps per-turn context small. Three hosts are supported out of the box:

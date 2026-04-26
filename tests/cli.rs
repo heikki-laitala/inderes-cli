@@ -187,6 +187,71 @@ fn call_list_without_login_prints_helpful_error() {
         .stderr(predicate::str::contains("not signed in"));
 }
 
+// --- uninstall ---------------------------------------------------------
+
+#[test]
+fn uninstall_yes_clears_tokens_and_prints_rm_hint() {
+    let (mut cmd, _tmp) = isolated();
+    cmd.args(["uninstall", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Tokens cleared"))
+        .stdout(predicate::str::contains("delete the binary yourself"));
+}
+
+#[test]
+fn uninstall_with_remove_skills_succeeds_when_none_installed() {
+    let (mut cmd, _tmp) = isolated();
+    cmd.args(["uninstall", "--yes", "--remove-skills"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no installed skill files"));
+}
+
+#[test]
+fn uninstall_actually_removes_skill_files_when_present() {
+    let (mut cmd, tmp) = isolated();
+    // Pre-seed an openclaw skill at the conventional location relative
+    // to HOME. The CLI's `uninstall --remove-skills` should pick it up.
+    let skill = tmp.path().join(".openclaw/skills/inderes/SKILL.md");
+    std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    std::fs::write(&skill, "name: inderes\n---\nbody").unwrap();
+
+    cmd.args(["uninstall", "--yes", "--remove-skills"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed"));
+
+    assert!(!skill.exists(), "skill file should have been removed");
+}
+
+// --- upgrade ----------------------------------------------------------
+
+#[test]
+fn upgrade_help_lists_check_only_and_force() {
+    let (mut cmd, _tmp) = isolated();
+    cmd.args(["upgrade", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--check-only"))
+        .stdout(predicate::str::contains("--force"));
+}
+
+#[test]
+fn upgrade_against_nonexistent_repo_surfaces_error() {
+    let (mut cmd, _tmp) = isolated();
+    // Direct upgrade at a repo that 404s. We don't need a mock server
+    // because GitHub's API will return a real 404 for nonsense paths.
+    cmd.env(
+        "INDERES_REPO",
+        "definitely-does-not-exist-12345/inderes-cli-test-please-ignore",
+    )
+    .args(["upgrade", "--check-only"])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("404").or(predicate::str::contains("error")));
+}
+
 // --- end-to-end subcommand dispatch with mocked MCP server ---------------
 //
 // These spin up an in-process MCP mock and pre-seed a tokens.json via the
