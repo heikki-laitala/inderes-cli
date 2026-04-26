@@ -11,6 +11,7 @@ mod mcp;
 mod oauth;
 mod skill;
 mod storage;
+mod upgrade;
 
 use std::path::PathBuf;
 
@@ -150,6 +151,26 @@ enum Command {
     Completions {
         /// Shell to generate completions for.
         shell: Shell,
+    },
+
+    /// Check for and install a newer release of inderes-cli.
+    Upgrade {
+        /// Print current vs latest version, exit without upgrading.
+        #[arg(long)]
+        check_only: bool,
+        /// Re-install even when already on the latest version.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Remove stored tokens and print commands to delete the binary.
+    Uninstall {
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Also delete installed skill files (~/.<host>/skills/inderes/).
+        #[arg(long)]
+        remove_skills: bool,
     },
 }
 
@@ -307,6 +328,9 @@ async fn run() -> Result<()> {
         }
 
         Command::Completions { shell } => commands::completions(shell),
+
+        Command::Upgrade { check_only, force } => commands::upgrade(&http, check_only, force).await,
+        Command::Uninstall { yes, remove_skills } => commands::uninstall(yes, remove_skills),
     }
 }
 

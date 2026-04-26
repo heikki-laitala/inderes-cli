@@ -319,6 +319,165 @@ pub fn completions(shell: Shell) -> Result<()> {
     Ok(())
 }
 
+// --- upgrade / uninstall --------------------------------------------------
+
+pub async fn upgrade(http: &reqwest::Client, check_only: bool, force: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let repo = crate::upgrade::upgrade_repo();
+    let latest_tag = crate::upgrade::fetch_latest_tag(http, &repo).await?;
+    let latest = latest_tag.strip_prefix('v').unwrap_or(&latest_tag);
+
+    println!("Current version: {current}");
+    println!("Latest release:  {latest_tag}");
+
+    let newer = crate::upgrade::version_is_newer(current, latest);
+    if !newer && !force {
+        println!();
+        println!("Already up to date.");
+        return Ok(());
+    }
+    if check_only {
+        println!();
+        println!("A newer release is available. Run `inderes upgrade` to install {latest_tag}.");
+        return Ok(());
+    }
+
+    let exe = std::env::current_exe().context("locating current binary")?;
+    let install_dir = exe
+        .parent()
+        .context("current binary has no parent dir")?
+        .to_path_buf();
+
+    println!();
+    println!("Upgrading via the install script.");
+    println!("Install directory: {}", install_dir.display());
+    println!();
+
+    let status = run_install_script(&install_dir, &latest_tag, &repo).await?;
+    if !status.success() {
+        bail!("install script exited with {status}");
+    }
+    println!();
+    println!("Done. Verify with: inderes --version");
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn run_install_script(
+    install_dir: &std::path::Path,
+    tag: &str,
+    repo: &str,
+) -> Result<std::process::ExitStatus> {
+    use tokio::process::Command;
+    let cmd = format!("curl -fsSL https://raw.githubusercontent.com/{repo}/main/install.sh | bash");
+    let status = Command::new("bash")
+        .arg("-c")
+        .arg(&cmd)
+        .env("INDERES_INSTALL_DIR", install_dir)
+        .env("INDERES_VERSION", tag)
+        .env("INDERES_REPO", repo)
+        .status()
+        .await
+        .context("spawning bash to run install.sh")?;
+    Ok(status)
+}
+
+#[cfg(windows)]
+async fn run_install_script(
+    install_dir: &std::path::Path,
+    tag: &str,
+    repo: &str,
+) -> Result<std::process::ExitStatus> {
+    use tokio::process::Command;
+    let cmd = format!("iwr -useb https://raw.githubusercontent.com/{repo}/main/install.ps1 | iex");
+    let status = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &cmd])
+        .env("INDERES_INSTALL_DIR", install_dir)
+        .env("INDERES_VERSION", tag)
+        .env("INDERES_REPO", repo)
+        .status()
+        .await
+        .context("spawning powershell to run install.ps1")?;
+    Ok(status)
+}
+
+/// Lists the on-disk skill paths for every supported host whose skill file
+/// is currently present. Pure helper for testability.
+pub(crate) fn installed_skill_paths() -> Vec<PathBuf> {
+    [
+        skill::Host::Openclaw,
+        skill::Host::Hermes,
+        skill::Host::Ptrclaw,
+    ]
+    .into_iter()
+    .map(|h| h.default_install_path())
+    .filter(|p| p.exists())
+    .collect()
+}
+
+pub fn uninstall(yes: bool, remove_skills: bool) -> Result<()> {
+    let exe = std::env::current_exe().context("locating current binary")?;
+    let token_path = storage::token_path()?;
+    let skills = if remove_skills {
+        installed_skill_paths()
+    } else {
+        Vec::new()
+    };
+
+    println!("This will:");
+    println!("  - clear stored tokens at {}", token_path.display());
+    if remove_skills {
+        if skills.is_empty() {
+            println!("  - (no installed skill files found to remove)");
+        } else {
+            for s in &skills {
+                println!("  - delete skill at {}", s.display());
+            }
+        }
+    }
+    println!(
+        "  - print the command you should run yourself to remove the binary at {}",
+        exe.display()
+    );
+
+    if !yes {
+        eprint!("Continue? [y/N] ");
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    storage::clear()?;
+    println!("✓ Tokens cleared from {}", token_path.display());
+
+    for s in &skills {
+        // Remove the SKILL.md and (best-effort) the now-empty parent dir.
+        if let Err(e) = fs::remove_file(s) {
+            eprintln!("  failed to remove {}: {e:#}", s.display());
+        } else {
+            println!("✓ Removed {}", s.display());
+            if let Some(parent) = s.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+        }
+    }
+
+    println!();
+    println!("To complete removal, delete the binary yourself:");
+    if cfg!(windows) {
+        println!("  Remove-Item \"{}\"", exe.display());
+    } else {
+        println!("  rm {}", exe.display());
+    }
+    println!();
+    println!("(The CLI cannot delete its own running binary cleanly across all platforms,");
+    println!("so we leave that final step in your hands.)");
+    Ok(())
+}
+
 // --- output helpers --------------------------------------------------------
 
 fn print_result(result: &Value, as_json: bool) -> Result<()> {

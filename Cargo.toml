@@ -28,7 +28,7 @@ sha2 = "0.11"
 base64 = "0.22"
 rand = "0.9"
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "process"] }
 url = "2"
 webbrowser = "1"
 futures-util = "0.3"
