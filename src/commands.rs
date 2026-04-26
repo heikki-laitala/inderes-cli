@@ -369,7 +369,15 @@ async fn run_install_script(
     repo: &str,
 ) -> Result<std::process::ExitStatus> {
     use tokio::process::Command;
-    let cmd = format!("curl -fsSL https://raw.githubusercontent.com/{repo}/main/install.sh | bash");
+    // `set -euo pipefail` is load-bearing here, not paranoia. Without
+    // pipefail, `curl X | bash` returns the inner bash's exit status —
+    // and an empty pipe (because curl 4xx/5xx'd) produces a no-op bash
+    // that exits 0, so `inderes upgrade` would report success while
+    // leaving the user on the old binary. With pipefail the pipeline's
+    // status reflects whichever command in the chain failed.
+    let cmd = format!(
+        "set -euo pipefail; curl -fsSL https://raw.githubusercontent.com/{repo}/main/install.sh | bash"
+    );
     let status = Command::new("bash")
         .arg("-c")
         .arg(&cmd)
@@ -389,7 +397,15 @@ async fn run_install_script(
     repo: &str,
 ) -> Result<std::process::ExitStatus> {
     use tokio::process::Command;
-    let cmd = format!("iwr -useb https://raw.githubusercontent.com/{repo}/main/install.ps1 | iex");
+    // Same rationale as the Unix branch: PowerShell's default
+    // `$ErrorActionPreference` is `Continue`, so a failing
+    // Invoke-WebRequest just yields $null and `iex` evaluates that as
+    // a no-op — exit 0, "upgrade complete", user still on old binary.
+    // `Stop` makes any non-terminating cmdlet error abort the script
+    // with a non-zero exit code so the failure surfaces.
+    let cmd = format!(
+        "$ErrorActionPreference = 'Stop'; iwr -useb https://raw.githubusercontent.com/{repo}/main/install.ps1 | iex"
+    );
     let status = Command::new("powershell")
         .args(["-NoProfile", "-Command", &cmd])
         .env("INDERES_INSTALL_DIR", install_dir)
