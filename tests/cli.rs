@@ -208,11 +208,17 @@ fn uninstall_with_remove_skills_succeeds_when_none_installed() {
         .stdout(predicate::str::contains("no installed skill files"));
 }
 
+// Unix-only: this test pre-seeds a skill at $HOME/.openclaw/... and relies on
+// the CLI resolving its install path off the same $HOME override. The
+// `directories` crate uses SHGetKnownFolderPath on Windows and ignores
+// $HOME / $USERPROFILE — so the override doesn't reach the CLI's path
+// resolver, and the pre-seeded file lives at a different place than the CLI
+// looks. The skill-removal logic itself is platform-agnostic and covered by
+// `uninstall_with_remove_skills_succeeds_when_none_installed` on every OS.
+#[cfg(unix)]
 #[test]
 fn uninstall_actually_removes_skill_files_when_present() {
     let (mut cmd, tmp) = isolated();
-    // Pre-seed an openclaw skill at the conventional location relative
-    // to HOME. The CLI's `uninstall --remove-skills` should pick it up.
     let skill = tmp.path().join(".openclaw/skills/inderes/SKILL.md");
     std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
     std::fs::write(&skill, "name: inderes\n---\nbody").unwrap();
