@@ -20,7 +20,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use base64::Engine;
-use rand::Rng;
+use rand::RngExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use time::{Duration as TimeDuration, OffsetDateTime};
