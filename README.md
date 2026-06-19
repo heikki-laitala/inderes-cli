@@ -177,7 +177,7 @@ inderes install-skill hermes     # -> ~/.hermes/skills/inderes/SKILL.md
 inderes install-skill ptrclaw    # -> ~/.ptrclaw/skills/inderes/SKILL.md
 ```
 
-Pass `--force` to overwrite an existing skill, `--dest <path>` to write somewhere else. The skill content is shipped inside the binary, so reinstalling after a CLI upgrade always gives the agent up-to-date guidance.
+Pass `--force` to overwrite an existing skill, `--dest <path>` to write somewhere else. The skill content is shipped inside the binary, and `inderes upgrade` automatically refreshes skills installed at their default paths — so an agent's guidance stays up to date without a manual reinstall (only re-run `install-skill` for custom `--dest` locations).
 
 All three skills teach the model to shell out to `inderes <subcommand>` via the host's terminal/bash/shell tool — no MCP server registration, no tool-schema bloat.
 
