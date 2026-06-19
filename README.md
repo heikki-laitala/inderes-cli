@@ -147,6 +147,7 @@ inderes --json forum topic 74 | jq '.post_stream.posts[].cooked'
 
 ```bash
 inderes forum activity 74             # posting volume over time + a momentum read
+inderes forum momentum                # rank ALL cached topics by momentum
 inderes forum db-path                 # path to the SQLite file
 inderes forum query "SELECT username, COUNT(*) n FROM posts GROUP BY username ORDER BY n DESC LIMIT 10"
 inderes --json forum query "SELECT date(created_at) d, COUNT(*) c FROM posts GROUP BY d ORDER BY d"
@@ -169,7 +170,7 @@ inderes forum clear 74       # drop one topic from the cache
 inderes forum clear --all    # wipe the cache (prompts; --yes to skip)
 ```
 
-`refresh-all` keeps a whole watchlist current in one go, so cross-topic comparisons (e.g. which thread's `activity` is accelerating) stay meaningful.
+`refresh-all` keeps a whole watchlist current in one go, and `forum momentum` then ranks every cached topic by how much it's heating up — the "which company is the crowd suddenly talking about?" view across your watchlist. (An attention signal over cached data; `refresh-all` first for a current picture.)
 
 `forum query` opens the cache **read-only**, so a query can never modify it; table output by default, `--json` emits rows as an array of objects. The `posts` table has typed columns (`id`, `topic_id`, `post_number`, `username`, `created_at`, `cooked`, …), a **`text`** column with the HTML stripped (query this, not `cooked`, for token-cheap reading), and a `raw` column with each post's full JSON (reach any other Discourse field via `json_extract(raw, '$.score')` etc.).
 

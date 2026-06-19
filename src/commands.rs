@@ -588,6 +588,60 @@ pub fn forum_activity(ctx: &ToolCtx<'_>, id: &str, bucket: &str, periods: u32) -
     Ok(())
 }
 
+/// Rank cached topics by momentum — which thread is heating up most. For each
+/// cached topic, compute its activity momentum (latest bucket vs the average of
+/// the rest) and sort descending. The cross-topic payoff of the cache: pair it
+/// with `refresh-all` to watch a whole watchlist.
+pub fn forum_momentum(ctx: &ToolCtx<'_>, bucket: &str, periods: u32) -> Result<()> {
+    if !cache::db_path()?.exists() {
+        if ctx.json_output {
+            println!("[]");
+        } else {
+            println!("No cached topics. Cache some with: inderes forum topic <id>");
+        }
+        return Ok(());
+    }
+    let cache = cache::Cache::open_readonly()?;
+    // (id, title, latest, baseline_avg, ratio)
+    let mut ranked: Vec<(i64, Option<String>, i64, f64, f64)> = Vec::new();
+    for t in cache.list_cached()? {
+        let series = cache.activity(t.id, bucket, periods)?;
+        if let Some((latest, avg, ratio)) = momentum(&series) {
+            ranked.push((t.id, t.title, latest, avg, ratio));
+        }
+    }
+    ranked.sort_by(|a, b| b.4.total_cmp(&a.4));
+
+    if ctx.json_output {
+        let arr: Vec<Value> = ranked
+            .iter()
+            .map(|(id, title, latest, avg, ratio)| {
+                json!({
+                    "id": id, "title": title, "latest": latest,
+                    "baseline_avg": (avg * 100.0).round() / 100.0,
+                    "ratio": (ratio * 100.0).round() / 100.0,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&Value::Array(arr))?);
+    } else if ranked.is_empty() {
+        println!(
+            "Not enough cached history to rank momentum (need 2+ active {bucket}s per topic)."
+        );
+    } else {
+        println!("Cross-topic momentum (by {bucket})");
+        println!("{:>6}  {:>6}  {:>5}  topic", "ratio", "latest", "avg");
+        for (id, title, latest, avg, ratio) in &ranked {
+            let title = title.as_deref().unwrap_or("(untitled)");
+            println!("{ratio:>5.1}x  {latest:>6}  {avg:>5.0}  #{id} {title}");
+        }
+        println!(
+            "\n(reflects cached posts; run `inderes forum refresh-all` for a current picture)"
+        );
+    }
+    Ok(())
+}
+
 /// `(latest_count, baseline_avg_of_earlier_periods, ratio)`. `None` with fewer
 /// than two periods (nothing to compare against).
 fn momentum(series: &[(String, i64)]) -> Option<(i64, f64, f64)> {
