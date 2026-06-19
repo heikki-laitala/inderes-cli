@@ -416,6 +416,87 @@ pub fn forum_query(ctx: &ToolCtx<'_>, sql: &str) -> Result<()> {
     Ok(())
 }
 
+/// Show posting activity over time for a cached topic — a per-bucket timeline
+/// plus a momentum read (latest bucket vs the average of the others).
+pub fn forum_activity(ctx: &ToolCtx<'_>, id: &str, bucket: &str, periods: u32) -> Result<()> {
+    let topic_id: i64 = id
+        .parse()
+        .map_err(|_| anyhow!("invalid topic id {id:?}: expected a number"))?;
+    let cache = cache::Cache::open_readonly()?;
+    let series = cache.activity(topic_id, bucket, periods)?;
+    if series.is_empty() {
+        bail!("no cached posts for topic {id} — run `inderes forum topic {id}` first");
+    }
+    if ctx.json_output {
+        let mut obj = Map::new();
+        obj.insert("bucket".into(), json!(bucket));
+        obj.insert(
+            "periods".into(),
+            Value::Array(
+                series
+                    .iter()
+                    .map(|(p, n)| json!({ "period": p, "count": n }))
+                    .collect(),
+            ),
+        );
+        if let Some((latest, avg, ratio)) = momentum(&series) {
+            obj.insert(
+                "momentum".into(),
+                json!({
+                    "latest": latest,
+                    "baseline_avg": (avg * 100.0).round() / 100.0,
+                    "ratio": (ratio * 100.0).round() / 100.0,
+                }),
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&Value::Object(obj))?);
+    } else {
+        print!("{}", render_activity(topic_id, bucket, &series));
+    }
+    Ok(())
+}
+
+/// `(latest_count, baseline_avg_of_earlier_periods, ratio)`. `None` with fewer
+/// than two periods (nothing to compare against).
+fn momentum(series: &[(String, i64)]) -> Option<(i64, f64, f64)> {
+    if series.len() < 2 {
+        return None;
+    }
+    let latest = series[series.len() - 1].1;
+    let earlier = &series[..series.len() - 1];
+    let avg = earlier.iter().map(|(_, n)| *n as f64).sum::<f64>() / earlier.len() as f64;
+    let ratio = if avg > 0.0 {
+        latest as f64 / avg
+    } else {
+        f64::INFINITY
+    };
+    Some((latest, avg, ratio))
+}
+
+/// Render the activity timeline as a small bar chart plus a momentum line.
+fn render_activity(topic_id: i64, bucket: &str, series: &[(String, i64)]) -> String {
+    let mut out = format!("Activity for topic #{topic_id} (by {bucket})\n");
+    let max = series.iter().map(|(_, n)| *n).max().unwrap_or(0).max(1);
+    for (p, n) in series {
+        let bar = "█".repeat(((*n as f64 / max as f64) * 24.0).round() as usize);
+        out.push_str(&format!("{p:<10}  {n:>5}  {bar}\n"));
+    }
+    if let Some((latest, avg, ratio)) = momentum(series) {
+        let label = if ratio >= 1.5 {
+            "heating up"
+        } else if ratio <= 0.66 {
+            "cooling off"
+        } else {
+            "steady"
+        };
+        out.push_str(&format!(
+            "\nMomentum: {latest} in the latest {bucket} vs {avg:.0} avg — {ratio:.1}x ({label})\n"
+        ));
+    }
+    out.push_str("(reflects cached posts; run `inderes forum topic` to refresh)\n");
+    out
+}
+
 /// Render query results as a simple column-aligned text table.
 fn render_query_table(r: &cache::QueryResult) -> String {
     if r.columns.is_empty() {
@@ -946,6 +1027,38 @@ mod tests {
     fn build_args_empty_yields_empty_object() {
         let args = build_args(vec![], None).unwrap();
         assert_eq!(args, json!({}));
+    }
+
+    // --- momentum / render_activity ---------------------------------------
+
+    #[test]
+    fn momentum_compares_latest_to_baseline() {
+        let s = vec![
+            ("w1".to_string(), 10i64),
+            ("w2".to_string(), 10),
+            ("w3".to_string(), 30),
+        ];
+        let (latest, avg, ratio) = momentum(&s).unwrap();
+        assert_eq!(latest, 30);
+        assert_eq!(avg, 10.0);
+        assert_eq!(ratio, 3.0);
+    }
+
+    #[test]
+    fn momentum_is_none_with_one_period() {
+        assert!(momentum(&[("w1".to_string(), 5i64)]).is_none());
+    }
+
+    #[test]
+    fn render_activity_shows_bars_and_momentum_label() {
+        let s = vec![
+            ("2026-W01".to_string(), 10i64),
+            ("2026-W02".to_string(), 30),
+        ];
+        let out = render_activity(7, "week", &s);
+        assert!(out.contains("topic #7"));
+        assert!(out.contains("Momentum"));
+        assert!(out.contains("heating up"), "got: {out}");
     }
 
     // --- render_query_table -----------------------------------------------
