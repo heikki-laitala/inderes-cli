@@ -10,7 +10,7 @@
 //! downstream work — e.g. sentiment analysis over posts — should use `--json`
 //! to get the raw Discourse fields (`cooked`, `created_at`, `username`, …).
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 
 /// Public Discourse instance. Overridable via `INDERES_FORUM_URL` (used by
@@ -52,18 +52,20 @@ impl<'a> ForumClient<'a> {
         let status = resp.status();
         // A 401/403 on an anonymous read is the signature of the forum being
         // switched to login-required (Discourse `login_required`). Diagnose it
-        // explicitly rather than emitting a bare status — there is nothing the
-        // user can do in this CLI to fix it (the forum's User-API-Key feature
-        // is disabled), so point them at the actual lever.
+        // explicitly rather than emitting a bare status. Name the actual base
+        // (overridable via INDERES_FORUM_URL) and keep the advice generic so a
+        // self-hosted mirror isn't told to "ask Inderes".
         if matches!(
             status,
             reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
         ) {
             bail!(
-                "forum.inderes.com denied anonymous access (HTTP {status}) — the forum may now \
-                 require login. This CLI reads the forum anonymously; its User-API-Key feature \
-                 is disabled, so authenticated access isn't currently possible. Ask Inderes to \
-                 enable it."
+                "{} denied anonymous access (HTTP {status}) — the forum may require login. \
+                 This CLI reads the forum anonymously and cannot authenticate: Discourse only \
+                 accepts a session cookie or a User-API-Key, and the public Inderes forum has \
+                 its User-API-Key feature disabled. Ask the forum administrators to enable it \
+                 for programmatic access.",
+                self.base
             );
         }
         // Body is intentionally kept out of the error: Discourse error pages
@@ -72,8 +74,18 @@ impl<'a> ForumClient<'a> {
             bail!("forum request to {path} returned HTTP {status}");
         }
         let body = resp.text().await.unwrap_or_default();
-        serde_json::from_str(&body)
-            .with_context(|| format!("parsing forum JSON response from {path}"))
+        serde_json::from_str(&body).map_err(|e| {
+            // A 200 carrying HTML (CDN / maintenance / login interstitial) is the
+            // common non-JSON case — say so instead of a bare parse error.
+            if body.trim_start().starts_with('<') {
+                anyhow!(
+                    "forum returned a non-JSON response from {path} (HTTP {status}) — likely an \
+                     HTML page (CDN, maintenance, or login interstitial), not the JSON API"
+                )
+            } else {
+                anyhow!("parsing forum JSON response from {path}: {e}")
+            }
+        })
     }
 
     /// Full-text search across topics and posts (`/search.json?q=`).
@@ -85,6 +97,11 @@ impl<'a> ForumClient<'a> {
     /// Discourse returns ~20 posts per page, so pass 2, 3, … to walk a long
     /// thread. Page 1 is sent without the query param so it matches the bare URL.
     pub async fn topic(&self, id: &str, page: u32) -> Result<Value> {
+        // Topic ids are integers; reject anything else so a stray slug or path
+        // segment fails clearly instead of producing a confusing request.
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+            bail!("invalid topic id {id:?}: expected a number (the id in a /t/<slug>/<id> URL)");
+        }
         let path = format!("/t/{id}.json");
         let page_s = page.to_string();
         let query: Vec<(&str, &str)> = if page > 1 {
@@ -114,11 +131,15 @@ impl<'a> ForumClient<'a> {
 /// Search results: one line per matched topic, with a stripped blurb from the
 /// best-matching post when Discourse supplies one.
 pub fn render_search(v: &Value) -> String {
-    let topics = v.get("topics").and_then(Value::as_array);
-    let posts = v.get("posts").and_then(Value::as_array);
-    let Some(topics) = topics.filter(|t| !t.is_empty()) else {
-        return "No matching topics.\n".to_string();
+    // Missing `topics` key = unexpected shape (dump raw); present-but-empty =
+    // a genuine no-results.
+    let Some(topics) = v.get("topics").and_then(Value::as_array) else {
+        return fallback_json(v);
     };
+    if topics.is_empty() {
+        return "No matching topics.\n".to_string();
+    }
+    let posts = v.get("posts").and_then(Value::as_array);
     let mut out = String::new();
     for t in topics {
         let id = t.get("id").and_then(Value::as_i64).unwrap_or(0);
@@ -140,6 +161,15 @@ pub fn render_search(v: &Value) -> String {
 /// stripped). Full bodies — not truncated — because the post text is the
 /// payload for downstream analysis.
 pub fn render_topic(v: &Value) -> String {
+    // No post_stream.posts at all = unexpected shape; dump raw JSON instead of
+    // masquerading as an empty topic.
+    let Some(posts) = v
+        .get("post_stream")
+        .and_then(|s| s.get("posts"))
+        .and_then(Value::as_array)
+    else {
+        return fallback_json(v);
+    };
     let title = v
         .get("title")
         .and_then(Value::as_str)
@@ -150,14 +180,10 @@ pub fn render_topic(v: &Value) -> String {
     }
     out.push('\n');
 
-    let posts = v
-        .get("post_stream")
-        .and_then(|s| s.get("posts"))
-        .and_then(Value::as_array);
-    let Some(posts) = posts.filter(|p| !p.is_empty()) else {
+    if posts.is_empty() {
         out.push_str("(no posts)\n");
         return out;
-    };
+    }
     for p in posts {
         let n = p.get("post_number").and_then(Value::as_i64).unwrap_or(0);
         let who = p.get("username").and_then(Value::as_str).unwrap_or("?");
@@ -172,13 +198,16 @@ pub fn render_topic(v: &Value) -> String {
 
 /// Latest topics list (`topic_list.topics`).
 pub fn render_latest(v: &Value) -> String {
-    let topics = v
+    let Some(topics) = v
         .get("topic_list")
         .and_then(|l| l.get("topics"))
-        .and_then(Value::as_array);
-    let Some(topics) = topics.filter(|t| !t.is_empty()) else {
-        return "No topics.\n".to_string();
+        .and_then(Value::as_array)
+    else {
+        return fallback_json(v);
     };
+    if topics.is_empty() {
+        return "No topics.\n".to_string();
+    }
     let mut out = String::new();
     for t in topics {
         let id = t.get("id").and_then(Value::as_i64).unwrap_or(0);
@@ -196,13 +225,16 @@ pub fn render_latest(v: &Value) -> String {
 
 /// Categories list (`category_list.categories`).
 pub fn render_categories(v: &Value) -> String {
-    let cats = v
+    let Some(cats) = v
         .get("category_list")
         .and_then(|l| l.get("categories"))
-        .and_then(Value::as_array);
-    let Some(cats) = cats.filter(|c| !c.is_empty()) else {
-        return "No categories.\n".to_string();
+        .and_then(Value::as_array)
+    else {
+        return fallback_json(v);
     };
+    if cats.is_empty() {
+        return "No categories.\n".to_string();
+    }
     let mut out = String::new();
     for c in cats {
         let name = c.get("name").and_then(Value::as_str).unwrap_or("(unnamed)");
@@ -216,6 +248,15 @@ pub fn render_categories(v: &Value) -> String {
         }
     }
     out
+}
+
+/// Fallback for an unrecognized response shape: show the raw JSON so a silent
+/// upstream change surfaces instead of masquerading as an empty result.
+fn fallback_json(v: &Value) -> String {
+    format!(
+        "(unrecognized forum response shape — showing raw JSON; pass --json for the same)\n{}\n",
+        serde_json::to_string_pretty(v).unwrap_or_default()
+    )
 }
 
 // --- pure helpers ----------------------------------------------------------
@@ -235,12 +276,22 @@ fn blurb_for_topic(posts: &[Value], topic_id: i64) -> Option<String> {
     })
 }
 
-/// Best-effort HTML → text: drop tags, collapse whitespace, decode the handful
-/// of entities Discourse emits. Not a parser; good enough for terminal reading.
+/// Best-effort HTML → text for terminal reading: map block boundaries to
+/// newlines (so multi-paragraph posts stay readable), drop remaining tags,
+/// collapse intra-line whitespace while keeping line breaks, then decode the
+/// handful of entities Discourse emits. Not a parser.
 fn strip_html(s: &str) -> String {
-    let mut text = String::with_capacity(s.len());
+    let with_breaks = s
+        .replace("</p>", "\n\n")
+        .replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("</li>", "\n")
+        .replace("</blockquote>", "\n");
+
+    let mut text = String::with_capacity(with_breaks.len());
     let mut in_tag = false;
-    for c in s.chars() {
+    for c in with_breaks.chars() {
         match c {
             '<' => in_tag = true,
             '>' => in_tag = false,
@@ -248,18 +299,33 @@ fn strip_html(s: &str) -> String {
             _ => text.push(c),
         }
     }
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    decode_entities(&collapsed)
+
+    // Collapse whitespace within each line but keep newlines; drop leading and
+    // consecutive blank lines so the output isn't riddled with gaps.
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() && lines.last().is_none_or(|l: &String| l.is_empty()) {
+            continue;
+        }
+        lines.push(collapsed);
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    decode_entities(&lines.join("\n"))
 }
 
 fn decode_entities(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
+    // `&amp;` must be decoded LAST: decoding it first would turn an encoded
+    // reference like "&amp;gt;" into "&gt;" and then into ">", double-decoding it.
+    s.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&hellip;", "…")
         .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
 }
 
 /// Truncate to at most `max` chars (char-safe), appending `…` when cut.
@@ -282,9 +348,23 @@ mod tests {
     // --- strip_html / decode_entities / truncate ---------------------------
 
     #[test]
-    fn strip_html_removes_tags_and_collapses_whitespace() {
+    fn strip_html_collapses_intra_line_whitespace_but_keeps_paragraphs() {
+        // Tags gone, runs of spaces collapsed, but the paragraph break between
+        // the two <p> blocks is preserved (one blank line).
         let html = "<p>Hello   <b>world</b></p>\n<p>second</p>";
-        assert_eq!(strip_html(html), "Hello world second");
+        assert_eq!(strip_html(html), "Hello world\n\nsecond");
+    }
+
+    #[test]
+    fn strip_html_converts_br_to_newline() {
+        assert_eq!(strip_html("line one<br>line two"), "line one\nline two");
+    }
+
+    #[test]
+    fn decode_entities_does_not_double_decode_amp() {
+        // "&amp;gt;" encodes the literal text "&gt;" — it must decode to "&gt;",
+        // not ">". Regression guard for &amp; being decoded before &gt;.
+        assert_eq!(strip_html("&amp;gt;"), "&gt;");
     }
 
     #[test]
@@ -345,12 +425,27 @@ mod tests {
     }
 
     #[test]
-    fn render_search_handles_no_results() {
+    fn render_search_empty_topics_is_a_genuine_no_result() {
+        // `topics` present but empty = no matches.
         assert_eq!(
             render_search(&json!({"topics": []})),
             "No matching topics.\n"
         );
-        assert_eq!(render_search(&json!({})), "No matching topics.\n");
+    }
+
+    #[test]
+    fn render_unrecognized_shape_dumps_raw_json_not_a_fake_empty() {
+        // `topics`/`topic_list`/`category_list`/`post_stream` missing entirely =
+        // unexpected shape; surface it instead of pretending it's empty.
+        for out in [
+            render_search(&json!({"unexpected": 1})),
+            render_latest(&json!({"unexpected": 1})),
+            render_categories(&json!({"unexpected": 1})),
+            render_topic(&json!({"unexpected": 1})),
+        ] {
+            assert!(out.contains("unrecognized"), "got: {out}");
+            assert!(out.contains("unexpected"), "got: {out}");
+        }
     }
 
     #[test]
@@ -486,6 +581,40 @@ mod tests {
         assert!(msg.contains("404"), "got: {msg}");
         // The HTML body must not leak into the error.
         assert!(!msg.contains("big error page"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn topic_rejects_non_numeric_id() {
+        // No network needed — validation happens before the request.
+        let http = reqwest::Client::new();
+        let client = ForumClient::new(&http, "https://example.com");
+        let err = client.topic("../latest", 1).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid topic id"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn html_200_is_reported_as_non_json() {
+        // A 200 carrying an HTML interstitial must produce a clear diagnostic,
+        // not a bare serde parse error, and must not leak the HTML body.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/latest.json"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<html><body>DO_NOT_LEAK_42</body></html>"),
+            )
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let client = ForumClient::new(&http, &server.uri());
+        let err = client.latest().await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("non-JSON"), "got: {msg}");
+        assert!(!msg.contains("DO_NOT_LEAK_42"), "got: {msg}");
     }
 
     #[tokio::test]

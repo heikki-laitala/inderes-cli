@@ -237,27 +237,27 @@ pub async fn documents_read(
 
 // --- forum (public Discourse, no auth) -------------------------------------
 
+fn forum_client<'a>(ctx: &ToolCtx<'a>) -> forum::ForumClient<'a> {
+    forum::ForumClient::new(ctx.http, &forum::forum_base())
+}
+
 pub async fn forum_search(ctx: &ToolCtx<'_>, query: &str) -> Result<()> {
-    let client = forum::ForumClient::new(ctx.http, &forum::forum_base());
-    let v = client.search(query).await?;
+    let v = forum_client(ctx).search(query).await?;
     print_forum(&v, ctx.json_output, forum::render_search)
 }
 
 pub async fn forum_topic(ctx: &ToolCtx<'_>, id: &str, page: u32) -> Result<()> {
-    let client = forum::ForumClient::new(ctx.http, &forum::forum_base());
-    let v = client.topic(id, page).await?;
+    let v = forum_client(ctx).topic(id, page).await?;
     print_forum(&v, ctx.json_output, forum::render_topic)
 }
 
 pub async fn forum_latest(ctx: &ToolCtx<'_>) -> Result<()> {
-    let client = forum::ForumClient::new(ctx.http, &forum::forum_base());
-    let v = client.latest().await?;
+    let v = forum_client(ctx).latest().await?;
     print_forum(&v, ctx.json_output, forum::render_latest)
 }
 
 pub async fn forum_categories(ctx: &ToolCtx<'_>) -> Result<()> {
-    let client = forum::ForumClient::new(ctx.http, &forum::forum_base());
-    let v = client.categories().await?;
+    let v = forum_client(ctx).categories().await?;
     print_forum(&v, ctx.json_output, forum::render_categories)
 }
 
