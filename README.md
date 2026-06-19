@@ -143,6 +143,17 @@ inderes --json forum topic 74 | jq '.post_stream.posts[].cooked'
 >
 > **Why no login.** The forum is open to all, so authentication isn't required — and isn't currently possible anyway: the forum signs in via the same Keycloak but issues a Discourse session cookie rather than a reusable token, and its third-party User-API-Key feature is disabled. If the forum is ever switched to login-required, anonymous reads return 401/403 and the CLI reports that explicitly instead of failing cryptically. Point the forum base elsewhere with `INDERES_FORUM_URL`.
 
+**Analyzing the cache.** Once topics are cached, query them with SQL straight from the CLI, or point your own tools at the database file:
+
+```bash
+inderes forum db-path                 # path to the SQLite file
+inderes forum query "SELECT username, COUNT(*) n FROM posts GROUP BY username ORDER BY n DESC LIMIT 10"
+inderes --json forum query "SELECT date(created_at) d, COUNT(*) c FROM posts GROUP BY d ORDER BY d"
+datasette "$(inderes forum db-path)"  # or duckdb / sqlite3 / pandas — it's a plain SQLite file
+```
+
+`forum query` opens the cache **read-only**, so a query can never modify it; table output by default, `--json` emits rows as an array of objects. The `posts` table has typed columns (`id`, `topic_id`, `post_number`, `username`, `created_at`, `cooked`, …) plus a `raw` column with each post's full JSON.
+
 ## Upgrade
 
 ```bash

@@ -228,6 +228,13 @@ enum ForumCmd {
     Latest,
     /// List forum categories.
     Categories,
+    /// Run a read-only SQL query against the local forum cache.
+    Query {
+        /// SQL to run (e.g. "SELECT username, COUNT(*) FROM posts GROUP BY username").
+        sql: String,
+    },
+    /// Print the path to the local forum cache database.
+    DbPath,
 }
 
 #[derive(Debug, Subcommand)]
@@ -340,6 +347,8 @@ async fn run() -> Result<()> {
         }
         Command::Forum(ForumCmd::Latest) => commands::forum_latest(&ctx).await,
         Command::Forum(ForumCmd::Categories) => commands::forum_categories(&ctx).await,
+        Command::Forum(ForumCmd::Query { sql }) => commands::forum_query(&ctx, &sql),
+        Command::Forum(ForumCmd::DbPath) => commands::forum_db_path(),
 
         Command::Call {
             tool,

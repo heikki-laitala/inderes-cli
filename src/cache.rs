@@ -14,12 +14,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use directories::ProjectDirs;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
 
 /// Handle to the on-disk (or in-memory, for tests) cache.
+#[derive(Debug)]
 pub struct Cache {
     conn: Connection,
 }
@@ -40,6 +41,25 @@ impl Cache {
         let cache = Self { conn };
         cache.migrate()?;
         Ok(cache)
+    }
+
+    /// Open the cache **read-only** for querying. Errors if it doesn't exist
+    /// yet — there's nothing to analyze until a `forum topic` has populated it.
+    /// Read-only means an arbitrary user/agent query can't mutate the cache.
+    pub fn open_readonly() -> Result<Self> {
+        Self::open_readonly_at(&db_path()?)
+    }
+
+    pub fn open_readonly_at(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            bail!(
+                "no forum cache at {} yet — run `inderes forum topic <id>` first",
+                path.display()
+            );
+        }
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("opening forum cache (read-only) at {}", path.display()))?;
+        Ok(Self { conn })
     }
 
     #[cfg(test)]
@@ -190,6 +210,27 @@ impl Cache {
         Ok(out)
     }
 
+    /// Run an arbitrary SQL query and return its columns and rows. Intended for
+    /// a read-only connection (see `open_readonly`) so a query can never mutate
+    /// the cache — a write statement errors with "readonly database".
+    pub fn query(&self, sql: &str) -> Result<QueryResult> {
+        let mut stmt = self.conn.prepare(sql).context("preparing SQL query")?;
+        let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let n = columns.len();
+        let rows = stmt
+            .query_map([], |row| {
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    out.push(sqlite_to_json(row.get::<_, rusqlite::types::Value>(i)?));
+                }
+                Ok(out)
+            })
+            .context("running SQL query")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("reading query results")?;
+        Ok(QueryResult { columns, rows })
+    }
+
     pub fn topic_title(&self, topic_id: i64) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -206,6 +247,27 @@ impl Cache {
             [topic_id],
             |r| r.get(0),
         )?)
+    }
+}
+
+/// Columns and rows returned by [`Cache::query`]; each row is one value per
+/// column, in `columns` order.
+#[derive(Debug)]
+pub struct QueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Value>>,
+}
+
+/// Convert a dynamically-typed SQLite cell into JSON. Blobs become a short
+/// placeholder rather than dumping binary.
+fn sqlite_to_json(v: rusqlite::types::Value) -> Value {
+    use rusqlite::types::Value as Sql;
+    match v {
+        Sql::Null => Value::Null,
+        Sql::Integer(i) => Value::from(i),
+        Sql::Real(f) => Value::from(f),
+        Sql::Text(s) => Value::String(s),
+        Sql::Blob(b) => Value::String(format!("[blob {} bytes]", b.len())),
     }
 }
 
@@ -307,6 +369,55 @@ mod tests {
         assert_eq!(c.post_count(7).unwrap(), 1);
         assert_eq!(c.post_count(8).unwrap(), 1);
         assert_eq!(c.get_posts(8).unwrap()[0]["username"], "b");
+    }
+
+    #[test]
+    fn query_returns_columns_and_rows() {
+        let c = Cache::open_in_memory().unwrap();
+        c.upsert_posts(7, &[post(10, 1, "alice", "x"), post(11, 2, "alice", "y")])
+            .unwrap();
+        c.upsert_posts(7, &[post(12, 3, "bob", "z")]).unwrap();
+        let r = c
+            .query("SELECT username, COUNT(*) n FROM posts GROUP BY username ORDER BY n DESC")
+            .unwrap();
+        assert_eq!(r.columns, vec!["username", "n"]);
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0][0], serde_json::json!("alice"));
+        assert_eq!(r.rows[0][1], serde_json::json!(2)); // integer mapped to JSON number
+    }
+
+    #[test]
+    fn readonly_connection_rejects_writes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("forum.db");
+        {
+            let c = Cache::open_at(&path).unwrap();
+            c.upsert_posts(7, &[post(10, 1, "alice", "x")]).unwrap();
+        }
+        let ro = Cache::open_readonly_at(&path).unwrap();
+        // Reads work...
+        assert_eq!(
+            ro.query("SELECT COUNT(*) FROM posts").unwrap().rows[0][0],
+            serde_json::json!(1)
+        );
+        // ...writes are refused by the read-only connection.
+        let err = ro.query("DELETE FROM posts").unwrap_err();
+        assert!(
+            format!("{err:#}").to_lowercase().contains("readonly")
+                || format!("{err:#}").to_lowercase().contains("read-only")
+                || format!("{err:#}").to_lowercase().contains("read only"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn open_readonly_errors_when_cache_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let err = Cache::open_readonly_at(&dir.path().join("nope.db")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no forum cache"),
+            "got: {err:#}"
+        );
     }
 
     #[test]
