@@ -214,7 +214,16 @@ impl Cache {
     /// a read-only connection (see `open_readonly`) so a query can never mutate
     /// the cache — a write statement errors with "readonly database".
     pub fn query(&self, sql: &str) -> Result<QueryResult> {
-        let mut stmt = self.conn.prepare(sql).context("preparing SQL query")?;
+        let trimmed = sql.trim();
+        if trimmed.is_empty() {
+            bail!("no SQL provided");
+        }
+        // `conn.prepare` compiles only the first statement and silently ignores
+        // the rest, so reject multi-statement input rather than drop it.
+        if !is_single_statement(trimmed) {
+            bail!("only a single SQL statement is supported");
+        }
+        let mut stmt = self.conn.prepare(trimmed).context("preparing SQL query")?;
         let columns: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
         let n = columns.len();
         let rows = stmt
@@ -259,16 +268,34 @@ pub struct QueryResult {
 }
 
 /// Convert a dynamically-typed SQLite cell into JSON. Blobs become a short
-/// placeholder rather than dumping binary.
+/// placeholder rather than dumping binary (the cache has no blob columns; this
+/// only matters for contrived queries like `randomblob()`).
 fn sqlite_to_json(v: rusqlite::types::Value) -> Value {
     use rusqlite::types::Value as Sql;
     match v {
         Sql::Null => Value::Null,
         Sql::Integer(i) => Value::from(i),
-        Sql::Real(f) => Value::from(f),
+        // serde_json can't represent NaN/Infinity (Value::from returns Null for
+        // them), which would masquerade as a SQL NULL. Surface them as strings.
+        Sql::Real(f) if f.is_finite() => Value::from(f),
+        Sql::Real(f) => Value::String(f.to_string()),
         Sql::Text(s) => Value::String(s),
         Sql::Blob(b) => Value::String(format!("[blob {} bytes]", b.len())),
     }
+}
+
+/// True unless `sql` contains a `;` (outside a string literal) followed by more
+/// SQL — i.e. it's a single statement, optionally with a trailing semicolon.
+fn is_single_statement(sql: &str) -> bool {
+    let mut in_str = false;
+    for (i, c) in sql.char_indices() {
+        match c {
+            '\'' => in_str = !in_str,
+            ';' if !in_str => return sql[i + 1..].trim().is_empty(),
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Resolve the cache DB path: `INDERES_FORUM_DB` if set, else the platform
@@ -408,6 +435,27 @@ mod tests {
                 || format!("{err:#}").to_lowercase().contains("read only"),
             "got: {err:#}"
         );
+    }
+
+    #[test]
+    fn query_rejects_empty_and_multi_statement() {
+        let c = Cache::open_in_memory().unwrap();
+        assert!(format!("{:#}", c.query("").unwrap_err()).contains("no SQL"));
+        assert!(format!("{:#}", c.query("   ").unwrap_err()).contains("no SQL"));
+        assert!(format!("{:#}", c.query("SELECT 1; SELECT 2").unwrap_err())
+            .contains("single SQL statement"));
+        // A trailing semicolon is fine, and a semicolon inside a string literal
+        // is not a statement separator.
+        assert!(c.query("SELECT 1;").is_ok());
+        assert!(c.query("SELECT 'a;b' AS s").is_ok());
+    }
+
+    #[test]
+    fn query_surfaces_non_finite_floats_as_strings() {
+        let c = Cache::open_in_memory().unwrap();
+        let r = c.query("SELECT 1e308 * 10 AS x").unwrap();
+        // Would be JSON null via Value::from(f64); we surface it as a string.
+        assert!(r.rows[0][0].is_string(), "got: {:?}", r.rows[0][0]);
     }
 
     #[test]

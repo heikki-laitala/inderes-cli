@@ -372,7 +372,11 @@ fn print_forum(v: &Value, as_json: bool, render: fn(&Value) -> String) -> Result
 /// Print the path to the local forum cache DB (so you can point sqlite3 /
 /// datasette / duckdb / pandas at it).
 pub fn forum_db_path() -> Result<()> {
-    println!("{}", cache::db_path()?.display());
+    let path = cache::db_path()?;
+    println!("{}", path.display());
+    if !path.exists() {
+        eprintln!("(no cache yet — run `inderes forum topic <id>` to create it)");
+    }
     Ok(())
 }
 
@@ -382,13 +386,22 @@ pub fn forum_query(ctx: &ToolCtx<'_>, sql: &str) -> Result<()> {
     let cache = cache::Cache::open_readonly()?;
     let result = cache.query(sql)?;
     if ctx.json_output {
-        let arr: Vec<Value> = result
-            .rows
-            .iter()
+        let cache::QueryResult { columns, rows } = result;
+        let arr: Vec<Value> = rows
+            .into_iter()
             .map(|row| {
                 let mut obj = Map::new();
-                for (col, val) in result.columns.iter().zip(row) {
-                    obj.insert(col.clone(), val.clone());
+                for (col, val) in columns.iter().zip(row) {
+                    // Duplicate column names (e.g. `SELECT a, b AS a`) would
+                    // collapse in a JSON object — suffix the repeats so no
+                    // column is silently dropped.
+                    let mut key = col.clone();
+                    let mut k = 2;
+                    while obj.contains_key(&key) {
+                        key = format!("{col}_{k}");
+                        k += 1;
+                    }
+                    obj.insert(key, val);
                 }
                 Value::Object(obj)
             })
@@ -396,6 +409,9 @@ pub fn forum_query(ctx: &ToolCtx<'_>, sql: &str) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&Value::Array(arr))?);
     } else {
         print!("{}", render_query_table(&result));
+        // Row count is metadata — keep it off stdout so the table pipes cleanly.
+        let n = result.rows.len();
+        eprintln!("({n} row{})", if n == 1 { "" } else { "s" });
     }
     Ok(())
 }
@@ -410,12 +426,12 @@ fn render_query_table(r: &cache::QueryResult) -> String {
         .iter()
         .map(|row| row.iter().map(cell_to_string).collect())
         .collect();
+    // Every row has exactly columns.len() cells (Cache::query guarantees it),
+    // so direct indexing is safe.
     let mut widths: Vec<usize> = r.columns.iter().map(|c| c.chars().count()).collect();
     for row in &cells {
         for (i, c) in row.iter().enumerate() {
-            if i < widths.len() {
-                widths[i] = widths[i].max(c.chars().count());
-            }
+            widths[i] = widths[i].max(c.chars().count());
         }
     }
     let pad = |s: &str, w: usize| format!("{s}{}", " ".repeat(w.saturating_sub(s.chars().count())));
@@ -440,13 +456,11 @@ fn render_query_table(r: &cache::QueryResult) -> String {
         let line: Vec<String> = row
             .iter()
             .enumerate()
-            .map(|(i, c)| pad(c, *widths.get(i).unwrap_or(&0)))
+            .map(|(i, c)| pad(c, widths[i]))
             .collect();
         out.push_str(line.join("  ").trim_end());
         out.push('\n');
     }
-    let n = r.rows.len();
-    out.push_str(&format!("({n} row{})\n", if n == 1 { "" } else { "s" }));
     out
 }
 
@@ -937,7 +951,7 @@ mod tests {
     // --- render_query_table -----------------------------------------------
 
     #[test]
-    fn render_query_table_aligns_and_counts_rows() {
+    fn render_query_table_aligns_columns() {
         let r = cache::QueryResult {
             columns: vec!["username".into(), "n".into()],
             rows: vec![
@@ -950,17 +964,18 @@ mod tests {
         assert!(out.contains("alice"));
         assert!(out.contains("bob"));
         assert!(out.contains("10"));
-        assert!(out.contains("(2 rows)"));
+        // The row count is emitted on stderr by forum_query, not in the table.
+        assert!(!out.contains("rows)"), "got: {out}");
     }
 
     #[test]
-    fn render_query_table_handles_empty_and_null() {
+    fn render_query_table_handles_null_cell() {
         let r = cache::QueryResult {
             columns: vec!["a".into()],
             rows: vec![vec![Value::Null]],
         };
         let out = render_query_table(&r);
-        assert!(out.contains("(1 row)"), "got: {out}");
+        assert!(out.starts_with("a\n"), "got: {out}"); // header present, null renders blank
     }
 
     // --- render_result / render_content_item ------------------------------
