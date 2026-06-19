@@ -217,6 +217,10 @@ enum ForumCmd {
     Topic {
         /// Numeric topic ID (the number in a /t/<slug>/<id> URL).
         id: String,
+        /// Page of posts to fetch (~20 per page, 1-based). Discourse paginates
+        /// long threads; pass 2, 3, … to read past the first page.
+        #[arg(long, default_value_t = 1)]
+        page: u32,
     },
     /// List the latest active topics.
     Latest,
@@ -329,7 +333,9 @@ async fn run() -> Result<()> {
         }) => commands::documents_read(&ctx, &document_id, sections).await,
 
         Command::Forum(ForumCmd::Search { query }) => commands::forum_search(&ctx, &query).await,
-        Command::Forum(ForumCmd::Topic { id }) => commands::forum_topic(&ctx, &id).await,
+        Command::Forum(ForumCmd::Topic { id, page }) => {
+            commands::forum_topic(&ctx, &id, page).await
+        }
         Command::Forum(ForumCmd::Latest) => commands::forum_latest(&ctx).await,
         Command::Forum(ForumCmd::Categories) => commands::forum_categories(&ctx).await,
 
