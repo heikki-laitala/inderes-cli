@@ -263,43 +263,27 @@ pub async fn forum_topic(ctx: &ToolCtx<'_>, id: &str, refresh: bool) -> Result<(
     let cache = cache::Cache::open()?;
     let client = forum_client(ctx);
 
-    let mut page = if refresh {
+    let start = if refresh {
         1
     } else {
         cache.last_page(topic_id)?.max(1)
     };
-    loop {
-        let v = match client.topic_page(id, page).await {
-            Ok(Some(v)) => v,
-            Ok(None) => break, // past the end of the thread
-            Err(e) => {
-                if cache.post_count(topic_id)? > 0 {
-                    eprintln!(
-                        "warning: forum fetch stopped at page {page} ({e:#}); \
-                         serving cached posts — re-run to resume."
-                    );
-                    break;
-                }
-                return Err(e);
-            }
-        };
-        let posts = v
-            .get("post_stream")
-            .and_then(|s| s.get("posts"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if posts.is_empty() {
-            break;
+    let (mut fetched_any, interrupted) =
+        walk_topic_pages(&client, &cache, id, topic_id, start).await?;
+
+    // A resumed walk (start > 1) that 404s immediately without fetching and
+    // without erroring is ambiguous: either the thread shrank below the cached
+    // watermark, or the topic was deleted / made private. Re-verify from page 1
+    // — that re-walks a shrunk thread (lowering the watermark) or confirms the
+    // topic is gone (so we don't silently pass off stale cache as fresh).
+    if !fetched_any && !interrupted && start > 1 {
+        (fetched_any, _) = walk_topic_pages(&client, &cache, id, topic_id, 1).await?;
+        if !fetched_any && cache.post_count(topic_id)? > 0 {
+            eprintln!(
+                "warning: forum topic {id} returned 404 (deleted or made private); \
+                 serving the cached copy."
+            );
         }
-        cache.upsert_posts(topic_id, &posts)?;
-        cache.set_topic_meta(
-            topic_id,
-            v.get("title").and_then(Value::as_str),
-            v.get("posts_count").and_then(Value::as_i64),
-            page,
-        )?;
-        page += 1;
     }
 
     if cache.post_count(topic_id)? == 0 {
@@ -312,6 +296,56 @@ pub async fn forum_topic(ctx: &ToolCtx<'_>, id: &str, refresh: bool) -> Result<(
         "post_stream": { "posts": cache.get_posts(topic_id)? },
     });
     print_forum(&envelope, ctx.json_output, forum::render_topic)
+}
+
+/// Walk a topic's pages from `start` until a page 404s (end of thread),
+/// upserting each page into the cache. Returns `(fetched_any, interrupted)`:
+/// `fetched_any` is whether any page yielded posts, `interrupted` is whether a
+/// transient error (rate limit / network) stopped the walk with cached posts
+/// still available to serve.
+async fn walk_topic_pages(
+    client: &forum::ForumClient<'_>,
+    cache: &cache::Cache,
+    id: &str,
+    topic_id: i64,
+    start: u32,
+) -> Result<(bool, bool)> {
+    let mut page = start;
+    let mut fetched_any = false;
+    loop {
+        let v = match client.topic_page(id, page).await {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok((fetched_any, false)), // past the end
+            Err(e) => {
+                if cache.post_count(topic_id)? > 0 {
+                    eprintln!(
+                        "warning: forum fetch stopped at page {page} ({e:#}); \
+                         serving cached posts — re-run to resume."
+                    );
+                    return Ok((fetched_any, true));
+                }
+                return Err(e);
+            }
+        };
+        let posts = v
+            .get("post_stream")
+            .and_then(|s| s.get("posts"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if posts.is_empty() {
+            return Ok((fetched_any, false));
+        }
+        cache.upsert_posts(topic_id, &posts)?;
+        cache.set_topic_meta(
+            topic_id,
+            v.get("title").and_then(Value::as_str),
+            v.get("posts_count").and_then(Value::as_i64),
+            page,
+        )?;
+        fetched_any = true;
+        page += 1;
+    }
 }
 
 pub async fn forum_latest(ctx: &ToolCtx<'_>) -> Result<()> {

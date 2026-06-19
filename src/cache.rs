@@ -92,7 +92,10 @@ impl Cache {
         Ok(v.unwrap_or(0).max(0) as u32)
     }
 
-    /// Record topic metadata and advance the page watermark (never backwards).
+    /// Record topic metadata and set the page watermark to the last page
+    /// fetched. The walk calls this with monotonically increasing page numbers,
+    /// so the final call stores the true high-water mark — and a `--refresh`
+    /// (or shrink re-walk) that ends on a lower page correctly lowers it.
     pub fn set_topic_meta(
         &self,
         topic_id: i64,
@@ -106,7 +109,7 @@ impl Cache {
              ON CONFLICT(id) DO UPDATE SET
                 title       = COALESCE(excluded.title, topics.title),
                 posts_count = COALESCE(excluded.posts_count, topics.posts_count),
-                last_page   = MAX(excluded.last_page, topics.last_page),
+                last_page   = excluded.last_page,
                 synced_at   = excluded.synced_at",
             params![topic_id, title, posts_count, last_page as i64],
         )?;
@@ -274,9 +277,10 @@ mod tests {
         assert_eq!(c.last_page(7).unwrap(), 0);
         c.set_topic_meta(7, Some("Title"), Some(40), 2).unwrap();
         assert_eq!(c.last_page(7).unwrap(), 2);
-        // Watermark never moves backwards.
+        // The watermark is absolute (a refresh/shrink re-walk that ends lower
+        // must lower it); title is preserved via COALESCE on a None update.
         c.set_topic_meta(7, None, None, 1).unwrap();
-        assert_eq!(c.last_page(7).unwrap(), 2);
+        assert_eq!(c.last_page(7).unwrap(), 1);
         assert_eq!(c.topic_title(7).unwrap().as_deref(), Some("Title"));
     }
 
