@@ -47,7 +47,7 @@ Append `--json` on any subcommand to get raw JSON (easier to post-process).
 ```bash
 inderes forum search "Nokia"      # full-text search across topics and posts
 inderes forum topic 74            # full thread (read-through SQLite cache)
-inderes forum topic 74 --refresh  # re-fetch whole thread, replacing the cache
+inderes forum topic 74 --refresh  # re-fetch from page 1, updating edits
 inderes forum latest              # latest active topics
 inderes forum categories          # category list
 ```

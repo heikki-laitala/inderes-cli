@@ -128,7 +128,7 @@ inderes --json search "Nokia" | jq '.content[0].text'
 ```bash
 inderes forum search "Nokia"      # full-text search across topics and posts
 inderes forum topic 74            # full thread, cached locally (see below)
-inderes forum topic 74 --refresh  # re-fetch the whole thread, replacing the cache
+inderes forum topic 74 --refresh  # re-fetch from page 1, updating edited posts
 inderes forum latest              # latest active topics
 inderes forum categories          # category list
 ```
@@ -139,7 +139,7 @@ inderes forum categories          # category list
 inderes --json forum topic 74 | jq '.post_stream.posts[].cooked'
 ```
 
-> **Read-through cache.** `forum topic <id>` is backed by a local SQLite cache: each call fetches only the posts added since last time, stores them, and serves the whole thread from disk — so re-reads are instant and a long thread is downloaded only once. The first call on a very long thread walks every page; it's resumable, so if it's interrupted or rate-limited, just re-run to continue. `--refresh` re-fetches from page 1 (picks up edited or deleted posts). The DB lives at the platform data dir; override with `INDERES_FORUM_DB`. Beyond avoiding re-downloads, the cache is a queryable corpus — posts land in real columns (`username`, `created_at`, `post_number`, `cooked`) for local analysis. Listings (search/latest/categories) are always live, never cached.
+> **Read-through cache.** `forum topic <id>` is backed by a local SQLite cache: each call fetches only the posts added since last time, stores them, and serves the whole thread from disk — so re-reads are instant and a long thread is downloaded only once. The first call on a very long thread walks every page; it's resumable, so if it's interrupted or rate-limited, just re-run to continue. `--refresh` re-walks from page 1 to pick up edits to older posts — it upserts rather than wiping, so an interrupted refresh never loses the cached copy. The DB lives at the platform data dir; override with `INDERES_FORUM_DB`. Beyond avoiding re-downloads, the cache is a queryable corpus — common fields land in real columns (`username`, `created_at`, `post_number`, `cooked`) for local analysis, and each post's full raw object is kept too, so `--json` stays faithful. Listings (search/latest/categories) are always live, never cached.
 >
 > **Why no login.** The forum is open to all, so authentication isn't required — and isn't currently possible anyway: the forum signs in via the same Keycloak but issues a Discourse session cookie rather than a reusable token, and its third-party User-API-Key feature is disabled. If the forum is ever switched to login-required, anonymous reads return 401/403 and the CLI reports that explicitly instead of failing cryptically. Point the forum base elsewhere with `INDERES_FORUM_URL`.
 

@@ -252,17 +252,22 @@ pub async fn forum_search(ctx: &ToolCtx<'_>, query: &str) -> Result<()> {
 /// posts), walks until a page 404s, upserts as it goes, then renders the whole
 /// thread from the cache. A mid-walk error keeps progress and serves what's
 /// cached, so re-running resumes from the watermark.
+///
+/// `--refresh` re-walks from page 1 (picking up edits to older posts). It
+/// upserts rather than wiping first, so a refresh interrupted by a rate limit
+/// or network error never destroys the previously-complete cached copy.
 pub async fn forum_topic(ctx: &ToolCtx<'_>, id: &str, refresh: bool) -> Result<()> {
     let topic_id: i64 = id
         .parse()
         .map_err(|_| anyhow!("invalid topic id {id:?}: expected a number"))?;
     let cache = cache::Cache::open()?;
-    if refresh {
-        cache.clear_topic(topic_id)?;
-    }
     let client = forum_client(ctx);
 
-    let mut page = cache.last_page(topic_id)?.max(1);
+    let mut page = if refresh {
+        1
+    } else {
+        cache.last_page(topic_id)?.max(1)
+    };
     loop {
         let v = match client.topic_page(id, page).await {
             Ok(Some(v)) => v,

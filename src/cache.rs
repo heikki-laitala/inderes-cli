@@ -68,6 +68,7 @@ impl Cache {
                     created_at  TEXT,
                     updated_at  TEXT,
                     cooked      TEXT,
+                    raw         TEXT,
                     fetched_at  TEXT
                  );
                  CREATE INDEX IF NOT EXISTS idx_posts_topic
@@ -112,21 +113,25 @@ impl Cache {
         Ok(())
     }
 
-    /// Upsert a batch of Discourse post objects. Returns how many had an `id`.
+    /// Upsert a batch of Discourse post objects. The common fields are pulled
+    /// into typed columns for SQL analysis; the whole object is also stored in
+    /// `raw` so `--json` keeps full fidelity (reactions, post_url, …). Returns
+    /// how many had an `id`.
     pub fn upsert_posts(&self, topic_id: i64, posts: &[Value]) -> Result<usize> {
         let tx = self.conn.unchecked_transaction()?;
         let mut count = 0;
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO posts
-                    (id, topic_id, post_number, username, created_at, updated_at, cooked, fetched_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+                    (id, topic_id, post_number, username, created_at, updated_at, cooked, raw, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))
                  ON CONFLICT(id) DO UPDATE SET
                     post_number = excluded.post_number,
                     username    = excluded.username,
                     created_at  = excluded.created_at,
                     updated_at  = excluded.updated_at,
                     cooked      = excluded.cooked,
+                    raw         = excluded.raw,
                     fetched_at  = excluded.fetched_at",
             )?;
             for p in posts {
@@ -141,6 +146,7 @@ impl Cache {
                     p.get("created_at").and_then(Value::as_str),
                     p.get("updated_at").and_then(Value::as_str),
                     p.get("cooked").and_then(Value::as_str),
+                    serde_json::to_string(p)?,
                 ])?;
                 count += 1;
             }
@@ -149,21 +155,29 @@ impl Cache {
         Ok(count)
     }
 
-    /// All cached posts for a topic, ordered by post number, shaped like the
-    /// Discourse post objects so the existing renderer can consume them.
+    /// All cached posts for a topic, ordered by post number. Returns the full
+    /// original post objects (from `raw`) so `--json` stays faithful; falls
+    /// back to the typed columns if `raw` is somehow missing.
     pub fn get_posts(&self, topic_id: i64) -> Result<Vec<Value>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, post_number, username, created_at, updated_at, cooked
+            "SELECT raw, id, post_number, username, created_at, updated_at, cooked
              FROM posts WHERE topic_id = ?1 ORDER BY post_number",
         )?;
         let rows = stmt.query_map([topic_id], |r| {
+            let raw: Option<String> = r.get(0)?;
+            if let Some(v) = raw
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            {
+                return Ok(v);
+            }
             Ok(json!({
-                "id": r.get::<_, i64>(0)?,
-                "post_number": r.get::<_, Option<i64>>(1)?,
-                "username": r.get::<_, Option<String>>(2)?,
-                "created_at": r.get::<_, Option<String>>(3)?,
-                "updated_at": r.get::<_, Option<String>>(4)?,
-                "cooked": r.get::<_, Option<String>>(5)?,
+                "id": r.get::<_, i64>(1)?,
+                "post_number": r.get::<_, Option<i64>>(2)?,
+                "username": r.get::<_, Option<String>>(3)?,
+                "created_at": r.get::<_, Option<String>>(4)?,
+                "updated_at": r.get::<_, Option<String>>(5)?,
+                "cooked": r.get::<_, Option<String>>(6)?,
             }))
         })?;
         let mut out = Vec::new();
@@ -189,15 +203,6 @@ impl Cache {
             [topic_id],
             |r| r.get(0),
         )?)
-    }
-
-    /// Drop everything cached for a topic (used by `--refresh`).
-    pub fn clear_topic(&self, topic_id: i64) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM posts WHERE topic_id = ?1", [topic_id])?;
-        self.conn
-            .execute("DELETE FROM topics WHERE id = ?1", [topic_id])?;
-        Ok(())
     }
 }
 
@@ -276,14 +281,18 @@ mod tests {
     }
 
     #[test]
-    fn clear_topic_removes_posts_and_meta() {
+    fn get_posts_preserves_full_raw_object() {
+        // Fields beyond the typed columns (e.g. reactions) must survive a
+        // round-trip so `--json` stays faithful.
         let c = Cache::open_in_memory().unwrap();
-        c.upsert_posts(7, &[post(10, 1, "alice", "x")]).unwrap();
-        c.set_topic_meta(7, Some("T"), Some(1), 1).unwrap();
-        c.clear_topic(7).unwrap();
-        assert_eq!(c.post_count(7).unwrap(), 0);
-        assert_eq!(c.last_page(7).unwrap(), 0);
-        assert_eq!(c.topic_title(7).unwrap(), None);
+        let rich = json!({
+            "id": 10, "post_number": 1, "username": "alice",
+            "cooked": "hi", "post_url": "/t/7/1", "reactions": [{"id": "heart", "count": 3}]
+        });
+        c.upsert_posts(7, &[rich]).unwrap();
+        let got = c.get_posts(7).unwrap();
+        assert_eq!(got[0]["post_url"], "/t/7/1");
+        assert_eq!(got[0]["reactions"][0]["count"], 3);
     }
 
     #[test]
