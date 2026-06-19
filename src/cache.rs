@@ -291,6 +291,40 @@ impl Cache {
         Ok(QueryResult { columns, rows })
     }
 
+    /// Post counts per time bucket for a topic — the most recent `limit`
+    /// buckets, returned chronologically (ascending). `bucket` is
+    /// day/week/month. Empty buckets (no posts) are omitted.
+    pub fn activity(&self, topic_id: i64, bucket: &str, limit: u32) -> Result<Vec<(String, i64)>> {
+        // `bucket` is validated to a fixed set, so interpolating the format is
+        // not an injection vector.
+        let fmt = match bucket {
+            "day" => "%Y-%m-%d",
+            "week" => "%Y-W%W",
+            "month" => "%Y-%m",
+            other => bail!("invalid bucket {other:?}: use day, week, or month"),
+        };
+        let sql = format!(
+            "SELECT period, n FROM (
+                 SELECT strftime('{fmt}', created_at) AS period, COUNT(*) AS n
+                 FROM posts
+                 WHERE topic_id = ?1 AND created_at IS NOT NULL
+                 GROUP BY period
+                 ORDER BY period DESC
+                 LIMIT ?2
+             ) ORDER BY period ASC",
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![topic_id, limit], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                    r.get::<_, i64>(1)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn topic_title(&self, topic_id: i64) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -486,6 +520,31 @@ mod tests {
                 || format!("{err:#}").to_lowercase().contains("read only"),
             "got: {err:#}"
         );
+    }
+
+    #[test]
+    fn activity_buckets_posts_by_period() {
+        let c = Cache::open_in_memory().unwrap();
+        c.upsert_posts(
+            7,
+            &[
+                json!({"id":1,"post_number":1,"created_at":"2026-01-05T10:00:00Z","cooked":"a"}),
+                json!({"id":2,"post_number":2,"created_at":"2026-01-06T10:00:00Z","cooked":"b"}),
+                json!({"id":3,"post_number":3,"created_at":"2026-01-20T10:00:00Z","cooked":"c"}),
+            ],
+        )
+        .unwrap();
+        let series = c.activity(7, "week", 12).unwrap();
+        // Two distinct weeks (validates strftime parses the ISO8601 created_at).
+        assert_eq!(series.len(), 2, "got: {series:?}");
+        assert_eq!(series.iter().map(|(_, n)| n).sum::<i64>(), 3);
+        assert!(series.windows(2).all(|w| w[0].0 <= w[1].0)); // ascending
+    }
+
+    #[test]
+    fn activity_rejects_unknown_bucket() {
+        let c = Cache::open_in_memory().unwrap();
+        assert!(c.activity(7, "fortnight", 12).is_err());
     }
 
     #[test]

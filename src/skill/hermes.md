@@ -56,6 +56,7 @@ inderes forum topic 74 --refresh  # re-fetch from page 1, updating edits
 inderes forum latest              # latest active topics
 inderes forum categories          # category list
 inderes forum query "<SQL>"       # read-only SQL over the cached posts
+inderes forum activity 74         # posting volume over time (momentum)
 inderes forum db-path             # path to the local SQLite cache
 ```
 

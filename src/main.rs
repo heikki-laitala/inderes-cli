@@ -18,7 +18,7 @@ mod upgrade;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
 pub const DEFAULT_ENDPOINT: &str = "https://mcp.inderes.com/";
@@ -233,8 +233,36 @@ enum ForumCmd {
         /// SQL to run (e.g. "SELECT username, COUNT(*) FROM posts GROUP BY username").
         sql: String,
     },
+    /// Show posting activity over time (momentum) for a cached topic.
+    Activity {
+        /// Numeric topic ID.
+        id: String,
+        /// Time bucket to group by.
+        #[arg(long, value_enum, default_value_t = Bucket::Week)]
+        bucket: Bucket,
+        /// Number of most-recent buckets to show.
+        #[arg(long, default_value_t = 12)]
+        periods: u32,
+    },
     /// Print the path to the local forum cache database.
     DbPath,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Bucket {
+    Day,
+    Week,
+    Month,
+}
+
+impl Bucket {
+    fn as_str(self) -> &'static str {
+        match self {
+            Bucket::Day => "day",
+            Bucket::Week => "week",
+            Bucket::Month => "month",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -348,6 +376,11 @@ async fn run() -> Result<()> {
         Command::Forum(ForumCmd::Latest) => commands::forum_latest(&ctx).await,
         Command::Forum(ForumCmd::Categories) => commands::forum_categories(&ctx).await,
         Command::Forum(ForumCmd::Query { sql }) => commands::forum_query(&ctx, &sql),
+        Command::Forum(ForumCmd::Activity {
+            id,
+            bucket,
+            periods,
+        }) => commands::forum_activity(&ctx, &id, bucket.as_str(), periods),
         Command::Forum(ForumCmd::DbPath) => commands::forum_db_path(),
 
         Command::Call {

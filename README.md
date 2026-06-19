@@ -146,11 +146,14 @@ inderes --json forum topic 74 | jq '.post_stream.posts[].cooked'
 **Analyzing the cache.** Once topics are cached, query them with SQL straight from the CLI, or point your own tools at the database file:
 
 ```bash
+inderes forum activity 74             # posting volume over time + a momentum read
 inderes forum db-path                 # path to the SQLite file
 inderes forum query "SELECT username, COUNT(*) n FROM posts GROUP BY username ORDER BY n DESC LIMIT 10"
 inderes --json forum query "SELECT date(created_at) d, COUNT(*) c FROM posts GROUP BY d ORDER BY d"
 datasette "$(inderes forum db-path)"  # or duckdb / sqlite3 / pandas — it's a plain SQLite file
 ```
+
+`forum activity <id>` buckets posts by day/week/month (`--bucket`, `--periods`) and prints a small bar chart plus a momentum read — whether the thread is heating up or cooling off (latest bucket vs the average of the rest). It's an attention signal over your cached data, so refresh the topic first for a current picture.
 
 `forum query` opens the cache **read-only**, so a query can never modify it; table output by default, `--json` emits rows as an array of objects. The `posts` table has typed columns (`id`, `topic_id`, `post_number`, `username`, `created_at`, `cooked`, …), a **`text`** column with the HTML stripped (query this, not `cooked`, for token-cheap reading), and a `raw` column with each post's full JSON (reach any other Discourse field via `json_extract(raw, '$.score')` etc.).
 
