@@ -15,6 +15,7 @@ use clap_complete::Shell;
 use serde_json::{json, Map, Value};
 
 use crate::auth;
+use crate::forum;
 use crate::mcp::McpClient;
 use crate::oauth::{self, IdpConfig};
 use crate::skill;
@@ -232,6 +233,43 @@ pub async fn documents_read(
         }),
     )
     .await
+}
+
+// --- forum (public Discourse, no auth) -------------------------------------
+
+pub async fn forum_search(ctx: &ToolCtx<'_>, query: &str) -> Result<()> {
+    let client = forum::ForumClient::new(ctx.http, &forum::forum_base());
+    let v = client.search(query).await?;
+    print_forum(&v, ctx.json_output, forum::render_search)
+}
+
+pub async fn forum_topic(ctx: &ToolCtx<'_>, id: &str) -> Result<()> {
+    let client = forum::ForumClient::new(ctx.http, &forum::forum_base());
+    let v = client.topic(id).await?;
+    print_forum(&v, ctx.json_output, forum::render_topic)
+}
+
+pub async fn forum_latest(ctx: &ToolCtx<'_>) -> Result<()> {
+    let client = forum::ForumClient::new(ctx.http, &forum::forum_base());
+    let v = client.latest().await?;
+    print_forum(&v, ctx.json_output, forum::render_latest)
+}
+
+pub async fn forum_categories(ctx: &ToolCtx<'_>) -> Result<()> {
+    let client = forum::ForumClient::new(ctx.http, &forum::forum_base());
+    let v = client.categories().await?;
+    print_forum(&v, ctx.json_output, forum::render_categories)
+}
+
+/// Print a forum response: raw pretty JSON under `--json`, otherwise the
+/// supplied human renderer.
+fn print_forum(v: &Value, as_json: bool, render: fn(&Value) -> String) -> Result<()> {
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(v)?);
+    } else {
+        print!("{}", render(v));
+    }
+    Ok(())
 }
 
 // --- generic escape hatch --------------------------------------------------
