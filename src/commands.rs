@@ -268,22 +268,12 @@ pub async fn forum_topic(ctx: &ToolCtx<'_>, id: &str, refresh: bool) -> Result<(
     } else {
         cache.last_page(topic_id)?.max(1)
     };
-    let (mut fetched_any, interrupted) =
-        walk_topic_pages(&client, &cache, id, topic_id, start).await?;
-
-    // A resumed walk (start > 1) that 404s immediately without fetching and
-    // without erroring is ambiguous: either the thread shrank below the cached
-    // watermark, or the topic was deleted / made private. Re-verify from page 1
-    // — that re-walks a shrunk thread (lowering the watermark) or confirms the
-    // topic is gone (so we don't silently pass off stale cache as fresh).
-    if !fetched_any && !interrupted && start > 1 {
-        (fetched_any, _) = walk_topic_pages(&client, &cache, id, topic_id, 1).await?;
-        if !fetched_any && cache.post_count(topic_id)? > 0 {
-            eprintln!(
-                "warning: forum topic {id} returned 404 (deleted or made private); \
-                 serving the cached copy."
-            );
-        }
+    let (fetched_any, _) = fetch_topic_incremental(&client, &cache, id, topic_id, start).await?;
+    if !fetched_any && start > 1 && cache.post_count(topic_id)? > 0 {
+        eprintln!(
+            "warning: forum topic {id} returned 404 (deleted or made private); \
+             serving the cached copy."
+        );
     }
 
     if cache.post_count(topic_id)? == 0 {
@@ -346,6 +336,28 @@ async fn walk_topic_pages(
         fetched_any = true;
         page += 1;
     }
+}
+
+/// Incrementally fetch a topic into the cache: walk from `start` until 404; if a
+/// resumed walk (start > 1) 404s immediately without fetching or erroring,
+/// re-verify from page 1 — that re-walks a shrunk thread (lowering a now-stale
+/// watermark) or confirms the topic is gone. Returns `(fetched_any,
+/// interrupted)`. Shared by `forum topic` and `refresh-all`.
+async fn fetch_topic_incremental(
+    client: &forum::ForumClient<'_>,
+    cache: &cache::Cache,
+    id: &str,
+    topic_id: i64,
+    start: u32,
+) -> Result<(bool, bool)> {
+    let (mut fetched_any, mut interrupted) =
+        walk_topic_pages(client, cache, id, topic_id, start).await?;
+    if !fetched_any && !interrupted && start > 1 {
+        let (f, i) = walk_topic_pages(client, cache, id, topic_id, 1).await?;
+        fetched_any = f;
+        interrupted = i;
+    }
+    Ok((fetched_any, interrupted))
 }
 
 pub async fn forum_latest(ctx: &ToolCtx<'_>) -> Result<()> {
@@ -446,21 +458,38 @@ pub async fn forum_refresh_all(ctx: &ToolCtx<'_>) -> Result<()> {
         return Ok(());
     }
     let client = forum_client(ctx);
-    let (count, mut total_new) = (ids.len(), 0i64);
+    let count = ids.len();
+    let mut total_new = 0i64;
+    let mut incomplete = 0usize;
     for topic_id in ids {
         let before = cache.post_count(topic_id)?;
         let start = cache.last_page(topic_id)?.max(1);
         let id_str = topic_id.to_string();
-        match walk_topic_pages(&client, &cache, &id_str, topic_id, start).await {
-            Ok(_) => {
+        match fetch_topic_incremental(&client, &cache, &id_str, topic_id, start).await {
+            Ok((_, interrupted)) => {
                 let new = cache.post_count(topic_id)? - before;
                 total_new += new;
-                println!("#{topic_id}: +{new} new");
+                if interrupted {
+                    incomplete += 1;
+                }
+                println!(
+                    "#{topic_id}: +{new} new{}",
+                    if interrupted { " (interrupted)" } else { "" }
+                );
             }
-            Err(e) => eprintln!("#{topic_id}: refresh failed: {e:#}"),
+            Err(e) => {
+                incomplete += 1;
+                eprintln!("#{topic_id}: refresh failed: {e:#}");
+            }
         }
     }
     println!("Refreshed {count} topic(s), {total_new} new post(s).");
+    if incomplete > 0 {
+        // Non-zero exit so automation doesn't treat a partial run as current.
+        bail!(
+            "{incomplete} topic(s) not fully refreshed (rate limit / network) — re-run to continue"
+        );
+    }
     Ok(())
 }
 
