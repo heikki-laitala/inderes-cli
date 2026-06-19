@@ -26,6 +26,7 @@ fn isolated() -> (Command, TempDir) {
     cmd.env_remove("INDERES_IDP_TOKEN_URL");
     cmd.env_remove("INDERES_IDP_USERINFO_URL");
     cmd.env_remove("INDERES_IDP_CLIENT_ID");
+    cmd.env_remove("INDERES_FORUM_URL");
     (cmd, tmp)
 }
 
@@ -52,12 +53,22 @@ fn help_lists_all_subcommands() {
         "estimates",
         "content",
         "documents",
+        "forum",
         "call",
         "install-skill",
         "completions",
     ];
     let mut assertion = cmd.arg("--help").assert().success();
     for sub in expected {
+        assertion = assertion.stdout(predicate::str::contains(sub));
+    }
+}
+
+#[test]
+fn forum_help_lists_subcommands() {
+    let (mut cmd, _tmp) = isolated();
+    let mut assertion = cmd.args(["forum", "--help"]).assert().success();
+    for sub in ["search", "topic", "latest", "categories"] {
         assertion = assertion.stdout(predicate::str::contains(sub));
     }
 }

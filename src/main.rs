@@ -7,6 +7,7 @@
 
 mod auth;
 mod commands;
+mod forum;
 mod mcp;
 mod oauth;
 mod skill;
@@ -119,6 +120,10 @@ enum Command {
     #[command(subcommand)]
     Documents(DocumentsCmd),
 
+    /// Read the public Inderes forum (forum.inderes.com). No login required.
+    #[command(subcommand)]
+    Forum(ForumCmd),
+
     /// Low-level: call any MCP tool directly.
     Call {
         /// Tool name (e.g. list-transcripts). Omit when using --list.
@@ -199,6 +204,24 @@ enum ContentCmd {
         #[arg(long)]
         lang: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ForumCmd {
+    /// Full-text search across forum topics and posts.
+    Search {
+        /// Free-text query.
+        query: String,
+    },
+    /// Show a topic and its posts by numeric topic ID.
+    Topic {
+        /// Numeric topic ID (the number in a /t/<slug>/<id> URL).
+        id: String,
+    },
+    /// List the latest active topics.
+    Latest,
+    /// List forum categories.
+    Categories,
 }
 
 #[derive(Debug, Subcommand)]
@@ -304,6 +327,11 @@ async fn run() -> Result<()> {
             document_id,
             sections,
         }) => commands::documents_read(&ctx, &document_id, sections).await,
+
+        Command::Forum(ForumCmd::Search { query }) => commands::forum_search(&ctx, &query).await,
+        Command::Forum(ForumCmd::Topic { id }) => commands::forum_topic(&ctx, &id).await,
+        Command::Forum(ForumCmd::Latest) => commands::forum_latest(&ctx).await,
+        Command::Forum(ForumCmd::Categories) => commands::forum_categories(&ctx).await,
 
         Command::Call {
             tool,
