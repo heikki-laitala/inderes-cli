@@ -296,8 +296,9 @@ fn blurb_for_topic(posts: &[Value], topic_id: i64) -> Option<String> {
 /// Best-effort HTML → text for terminal reading: map block boundaries to
 /// newlines (so multi-paragraph posts stay readable), drop remaining tags,
 /// collapse intra-line whitespace while keeping line breaks, then decode the
-/// handful of entities Discourse emits. Not a parser.
-fn strip_html(s: &str) -> String {
+/// handful of entities Discourse emits. Not a parser. Also used by the cache to
+/// populate the clean-text `text` column.
+pub(crate) fn strip_html(s: &str) -> String {
     let with_breaks = s
         .replace("</p>", "\n\n")
         .replace("<br>", "\n")
