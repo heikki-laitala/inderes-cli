@@ -55,6 +55,9 @@ inderes forum latest              # latest active topics
 inderes forum categories          # category list
 inderes forum query "<SQL>"       # read-only SQL over the cached posts
 inderes forum activity 74         # posting volume over time (momentum)
+inderes forum topics             # list cached topics
+inderes forum refresh-all        # pull new posts for every cached topic
+inderes forum clear <id>         # drop one cached topic (--all to wipe)
 inderes forum db-path             # path to the local SQLite cache
 ```
 

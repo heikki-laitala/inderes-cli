@@ -369,6 +369,109 @@ fn print_forum(v: &Value, as_json: bool, render: fn(&Value) -> String) -> Result
     Ok(())
 }
 
+/// List locally cached topics (the inventory).
+pub fn forum_topics(ctx: &ToolCtx<'_>) -> Result<()> {
+    if !cache::db_path()?.exists() {
+        if ctx.json_output {
+            println!("[]");
+        } else {
+            println!("No cached topics. Cache one with: inderes forum topic <id>");
+        }
+        return Ok(());
+    }
+    let cache = cache::Cache::open_readonly()?;
+    let topics = cache.list_cached()?;
+    if ctx.json_output {
+        let arr: Vec<Value> = topics
+            .iter()
+            .map(|t| {
+                json!({ "id": t.id, "title": t.title, "posts": t.posts, "synced_at": t.synced_at })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&Value::Array(arr))?);
+    } else if topics.is_empty() {
+        println!("No cached topics. Cache one with: inderes forum topic <id>");
+    } else {
+        for t in &topics {
+            let title = t.title.as_deref().unwrap_or("(untitled)");
+            let synced = t.synced_at.as_deref().unwrap_or("?");
+            println!(
+                "#{:<7} {:>6} posts  synced {synced}  {title}",
+                t.id, t.posts
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Remove a topic from the cache, or the whole cache with `--all`.
+pub fn forum_clear(id: Option<&str>, all: bool, yes: bool) -> Result<()> {
+    if !cache::db_path()?.exists() {
+        println!("No cache to clear.");
+        return Ok(());
+    }
+    let cache = cache::Cache::open()?;
+    match (id, all) {
+        (Some(_), true) => bail!("pass either a topic id or --all, not both"),
+        (None, false) => bail!("specify a topic id, or --all to clear the whole cache"),
+        (Some(id), false) => {
+            let topic_id: i64 = id
+                .parse()
+                .map_err(|_| anyhow!("invalid topic id {id:?}: expected a number"))?;
+            cache.clear_topic(topic_id)?;
+            println!("Cleared topic {topic_id} from the cache.");
+        }
+        (None, true) => {
+            if !yes && !confirm("Clear the entire forum cache?")? {
+                println!("Aborted.");
+                return Ok(());
+            }
+            cache.clear_all()?;
+            println!("Cleared the entire forum cache.");
+        }
+    }
+    Ok(())
+}
+
+/// Refresh every cached topic — pull new posts for each (incremental).
+pub async fn forum_refresh_all(ctx: &ToolCtx<'_>) -> Result<()> {
+    if !cache::db_path()?.exists() {
+        println!("No cached topics to refresh.");
+        return Ok(());
+    }
+    let cache = cache::Cache::open()?;
+    let ids = cache.cached_topic_ids()?;
+    if ids.is_empty() {
+        println!("No cached topics to refresh.");
+        return Ok(());
+    }
+    let client = forum_client(ctx);
+    let (count, mut total_new) = (ids.len(), 0i64);
+    for topic_id in ids {
+        let before = cache.post_count(topic_id)?;
+        let start = cache.last_page(topic_id)?.max(1);
+        let id_str = topic_id.to_string();
+        match walk_topic_pages(&client, &cache, &id_str, topic_id, start).await {
+            Ok(_) => {
+                let new = cache.post_count(topic_id)? - before;
+                total_new += new;
+                println!("#{topic_id}: +{new} new");
+            }
+            Err(e) => eprintln!("#{topic_id}: refresh failed: {e:#}"),
+        }
+    }
+    println!("Refreshed {count} topic(s), {total_new} new post(s).");
+    Ok(())
+}
+
+/// Prompt for y/N confirmation on stderr.
+fn confirm(prompt: &str) -> Result<bool> {
+    eprint!("{prompt} [y/N] ");
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
 /// Print the path to the local forum cache DB (so you can point sqlite3 /
 /// datasette / duckdb / pandas at it).
 pub fn forum_db_path() -> Result<()> {
