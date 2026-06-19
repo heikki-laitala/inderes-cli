@@ -295,17 +295,21 @@ impl Cache {
     /// buckets, returned chronologically (ascending). `bucket` is
     /// day/week/month. Empty buckets (no posts) are omitted.
     pub fn activity(&self, topic_id: i64, bucket: &str, limit: u32) -> Result<Vec<(String, i64)>> {
-        // `bucket` is validated to a fixed set, so interpolating the format is
-        // not an injection vector.
-        let fmt = match bucket {
-            "day" => "%Y-%m-%d",
-            "week" => "%Y-W%W",
-            "month" => "%Y-%m",
+        // `bucket` is validated to a fixed set, so interpolating the expression
+        // is not an injection vector. Weeks bucket by the Monday-of-week *date*
+        // rather than strftime %W: %Y/%W disagree across New Year (e.g.
+        // 2025-12-31 -> 2025-W52 but 2026-01-01 -> 2026-W00), which would split
+        // one real week into two buckets.
+        let period_expr = match bucket {
+            "day" => "strftime('%Y-%m-%d', created_at)".to_string(),
+            "week" => "date(created_at, '-' || ((strftime('%w', created_at) + 6) % 7) || ' days')"
+                .to_string(),
+            "month" => "strftime('%Y-%m', created_at)".to_string(),
             other => bail!("invalid bucket {other:?}: use day, week, or month"),
         };
         let sql = format!(
             "SELECT period, n FROM (
-                 SELECT strftime('{fmt}', created_at) AS period, COUNT(*) AS n
+                 SELECT {period_expr} AS period, COUNT(*) AS n
                  FROM posts
                  WHERE topic_id = ?1 AND created_at IS NOT NULL
                  GROUP BY period
@@ -539,6 +543,28 @@ mod tests {
         assert_eq!(series.len(), 2, "got: {series:?}");
         assert_eq!(series.iter().map(|(_, n)| n).sum::<i64>(), 3);
         assert!(series.windows(2).all(|w| w[0].0 <= w[1].0)); // ascending
+    }
+
+    #[test]
+    fn activity_week_bucket_does_not_split_across_new_year() {
+        // 2025-12-31 (Wed) and 2026-01-01 (Thu) are the same Mon-start week;
+        // strftime %W would split them (2025-W52 vs 2026-W00).
+        let c = Cache::open_in_memory().unwrap();
+        c.upsert_posts(
+            7,
+            &[
+                json!({"id":1,"post_number":1,"created_at":"2025-12-31T10:00:00Z","cooked":"a"}),
+                json!({"id":2,"post_number":2,"created_at":"2026-01-01T10:00:00Z","cooked":"b"}),
+            ],
+        )
+        .unwrap();
+        let series = c.activity(7, "week", 12).unwrap();
+        assert_eq!(
+            series.len(),
+            1,
+            "same week must be one bucket, got: {series:?}"
+        );
+        assert_eq!(series[0].1, 2);
     }
 
     #[test]
