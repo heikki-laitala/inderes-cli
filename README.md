@@ -152,7 +152,9 @@ inderes --json forum query "SELECT date(created_at) d, COUNT(*) c FROM posts GRO
 datasette "$(inderes forum db-path)"  # or duckdb / sqlite3 / pandas — it's a plain SQLite file
 ```
 
-`forum query` opens the cache **read-only**, so a query can never modify it; table output by default, `--json` emits rows as an array of objects. The `posts` table has typed columns (`id`, `topic_id`, `post_number`, `username`, `created_at`, `cooked`, …) plus a `raw` column with each post's full JSON.
+`forum query` opens the cache **read-only**, so a query can never modify it; table output by default, `--json` emits rows as an array of objects. The `posts` table has typed columns (`id`, `topic_id`, `post_number`, `username`, `created_at`, `cooked`, …), a **`text`** column with the HTML stripped (query this, not `cooked`, for token-cheap reading), and a `raw` column with each post's full JSON (reach any other Discourse field via `json_extract(raw, '$.score')` etc.).
+
+**Model-judgment analysis (summary, sentiment) is done by the agent, not the CLI.** The CLI just serves clean, sliceable data; an agent does the reasoning with its own model — e.g. pull the latest 40 posts' `text` to be caught up, chunk a long thread by `post_number` ranges to summarize it (map-reduce), or classify a high-`score` slice for bull-vs-bear. The installed skills include these query recipes.
 
 ## Upgrade
 

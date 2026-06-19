@@ -88,6 +88,7 @@ impl Cache {
                     created_at  TEXT,
                     updated_at  TEXT,
                     cooked      TEXT,
+                    text        TEXT,
                     raw         TEXT,
                     fetched_at  TEXT
                  );
@@ -95,6 +96,45 @@ impl Cache {
                     ON posts(topic_id, post_number);",
             )
             .context("migrating forum cache schema")?;
+
+        // Caches created before the clean-text column need it added and
+        // backfilled once (CREATE TABLE IF NOT EXISTS won't alter an existing
+        // table).
+        let has_text: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('posts') WHERE name = 'text'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_text == 0 {
+            self.conn
+                .execute("ALTER TABLE posts ADD COLUMN text TEXT", [])
+                .context("adding text column")?;
+            self.backfill_text()?;
+        }
+        Ok(())
+    }
+
+    /// One-time backfill of the `text` column from `cooked` for rows that
+    /// predate it.
+    fn backfill_text(&self) -> Result<()> {
+        let pending: Vec<(i64, Option<String>)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, cooked FROM posts WHERE text IS NULL")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        for (id, cooked) in pending {
+            let text = cooked.as_deref().map(crate::forum::strip_html);
+            tx.execute(
+                "UPDATE posts SET text = ?1 WHERE id = ?2",
+                params![text, id],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -146,14 +186,15 @@ impl Cache {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO posts
-                    (id, topic_id, post_number, username, created_at, updated_at, cooked, raw, fetched_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, datetime('now'))
+                    (id, topic_id, post_number, username, created_at, updated_at, cooked, text, raw, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
                  ON CONFLICT(id) DO UPDATE SET
                     post_number = excluded.post_number,
                     username    = excluded.username,
                     created_at  = excluded.created_at,
                     updated_at  = excluded.updated_at,
                     cooked      = excluded.cooked,
+                    text        = excluded.text,
                     raw         = excluded.raw,
                     fetched_at  = excluded.fetched_at",
             )?;
@@ -161,6 +202,8 @@ impl Cache {
                 let Some(id) = p.get("id").and_then(Value::as_i64) else {
                     continue;
                 };
+                let cooked = p.get("cooked").and_then(Value::as_str);
+                let text = cooked.map(crate::forum::strip_html);
                 stmt.execute(params![
                     id,
                     topic_id,
@@ -168,7 +211,8 @@ impl Cache {
                     p.get("username").and_then(Value::as_str),
                     p.get("created_at").and_then(Value::as_str),
                     p.get("updated_at").and_then(Value::as_str),
-                    p.get("cooked").and_then(Value::as_str),
+                    cooked,
+                    text,
                     serde_json::to_string(p)?,
                 ])?;
                 count += 1;
@@ -435,6 +479,45 @@ mod tests {
                 || format!("{err:#}").to_lowercase().contains("read only"),
             "got: {err:#}"
         );
+    }
+
+    #[test]
+    fn upsert_populates_clean_text_column() {
+        let c = Cache::open_in_memory().unwrap();
+        c.upsert_posts(
+            7,
+            &[json!({"id": 1, "post_number": 1, "cooked": "<p>Hello <b>world</b></p>"})],
+        )
+        .unwrap();
+        let r = c.query("SELECT text FROM posts WHERE id = 1").unwrap();
+        assert_eq!(r.rows[0][0], json!("Hello world"));
+    }
+
+    #[test]
+    fn migration_adds_and_backfills_text_for_old_caches() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            // Simulate a pre-`text` cache: posts table without the column.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY, topic_id INTEGER NOT NULL,
+                    post_number INTEGER, username TEXT, created_at TEXT, updated_at TEXT,
+                    cooked TEXT, raw TEXT, fetched_at TEXT);
+                 CREATE TABLE topics (id INTEGER PRIMARY KEY, title TEXT, posts_count INTEGER,
+                    last_page INTEGER NOT NULL DEFAULT 0, synced_at TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO posts (id, topic_id, cooked) VALUES (1, 7, '<p>Hi <b>there</b></p>')",
+                [],
+            )
+            .unwrap();
+        }
+        // Opening migrates: adds the column and backfills from cooked.
+        let c = Cache::open_at(&path).unwrap();
+        let r = c.query("SELECT text FROM posts WHERE id = 1").unwrap();
+        assert_eq!(r.rows[0][0], json!("Hi there"));
     }
 
     #[test]

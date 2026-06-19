@@ -59,6 +59,16 @@ inderes forum db-path             # path to the local SQLite cache
 
 Add `--json` for raw Discourse fields (`cooked` = post body HTML, `username`, `created_at`) when extracting post text for analysis. `forum topic` returns the **whole** thread, backed by a local SQLite read-through cache: only new posts are fetched each call, and the full thread is served from disk (first call on a huge thread is slow but resumable; re-run if interrupted). This is separate from the authenticated MCP tool `inderes call search-forum-topics`. Cached posts are queryable with `inderes forum query "<SQL>"` (read-only) — e.g. most active users on a stock, or posting volume over time.
 
+## Analyzing cached threads (you reason, the CLI only serves data)
+
+The cache has a clean-text `text` column (HTML stripped) — query `text`, not `cooked`, to save tokens. Cache a topic first with `inderes forum topic <id>`, then:
+
+- **Catch me up** (recent posts): `inderes --json forum query "SELECT post_number, username, date(created_at) d, text FROM posts WHERE topic_id=74 ORDER BY post_number DESC LIMIT 40"` → summarize the result yourself.
+- **Summarize a long thread** (map-reduce — a big thread won't fit in context): pull it in chunks, summarize each, then combine. Get the size with `SELECT MAX(post_number) FROM posts WHERE topic_id=74`, then `... WHERE topic_id=74 AND post_number BETWEEN 1 AND 500 ORDER BY post_number` (repeat for 501–1000, …).
+- **Sentiment / bull-vs-bear**: classify a representative slice — the posts the thread reacted to, plus the latest: `inderes --json forum query "SELECT username, text, json_extract(raw,'$.score') score FROM posts WHERE topic_id=74 ORDER BY score DESC LIMIT 50"`.
+
+The CLI never summarizes or scores — it returns rows; you do the judgment with your own model.
+
 ## Escape hatch: all 16 tools
 
 The server exposes more tools than the friendly subcommands wrap. To see everything:
