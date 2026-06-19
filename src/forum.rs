@@ -81,10 +81,18 @@ impl<'a> ForumClient<'a> {
         self.get_json("/search.json", &[("q", query)]).await
     }
 
-    /// A single topic with its post stream (`/t/<id>.json`).
-    pub async fn topic(&self, id: &str) -> Result<Value> {
+    /// A single topic with its post stream (`/t/<id>.json`). `page` is 1-based;
+    /// Discourse returns ~20 posts per page, so pass 2, 3, … to walk a long
+    /// thread. Page 1 is sent without the query param so it matches the bare URL.
+    pub async fn topic(&self, id: &str, page: u32) -> Result<Value> {
         let path = format!("/t/{id}.json");
-        self.get_json(&path, &[]).await
+        let page_s = page.to_string();
+        let query: Vec<(&str, &str)> = if page > 1 {
+            vec![("page", page_s.as_str())]
+        } else {
+            Vec::new()
+        };
+        self.get_json(&path, &query).await
     }
 
     /// Latest active topics (`/latest.json`).
@@ -268,7 +276,7 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // --- strip_html / decode_entities / truncate ---------------------------
@@ -422,10 +430,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn topic_hits_topic_path() {
+    async fn topic_page_1_omits_the_page_query_param() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/t/123.json"))
+            .and(query_param_is_missing("page"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": 123, "title": "Topic", "post_stream": {"posts": []}
             })))
@@ -435,8 +444,30 @@ mod tests {
 
         let http = reqwest::Client::new();
         let client = ForumClient::new(&http, &server.uri());
-        let v = client.topic("123").await.unwrap();
+        let v = client.topic("123", 1).await.unwrap();
         assert_eq!(v["id"], 123);
+    }
+
+    #[tokio::test]
+    async fn topic_page_n_sends_the_page_query_param() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/t/123.json"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": 123, "title": "T",
+                "post_stream": {"posts": [
+                    {"post_number": 21, "username": "u", "cooked": "<p>x</p>"}
+                ]}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let client = ForumClient::new(&http, &server.uri());
+        let v = client.topic("123", 2).await.unwrap();
+        assert_eq!(v["post_stream"]["posts"][0]["post_number"], 21);
     }
 
     #[tokio::test]
@@ -450,7 +481,7 @@ mod tests {
 
         let http = reqwest::Client::new();
         let client = ForumClient::new(&http, &server.uri());
-        let err = client.topic("404").await.unwrap_err();
+        let err = client.topic("404", 1).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("404"), "got: {msg}");
         // The HTML body must not leak into the error.

@@ -243,9 +243,9 @@ pub async fn forum_search(ctx: &ToolCtx<'_>, query: &str) -> Result<()> {
     print_forum(&v, ctx.json_output, forum::render_search)
 }
 
-pub async fn forum_topic(ctx: &ToolCtx<'_>, id: &str) -> Result<()> {
+pub async fn forum_topic(ctx: &ToolCtx<'_>, id: &str, page: u32) -> Result<()> {
     let client = forum::ForumClient::new(ctx.http, &forum::forum_base());
-    let v = client.topic(id).await?;
+    let v = client.topic(id, page).await?;
     print_forum(&v, ctx.json_output, forum::render_topic)
 }
 
