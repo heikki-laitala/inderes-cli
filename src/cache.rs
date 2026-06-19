@@ -346,6 +346,63 @@ impl Cache {
             |r| r.get(0),
         )?)
     }
+
+    /// Inventory of cached topics (most recently synced first), with the actual
+    /// number of posts stored for each.
+    pub fn list_cached(&self) -> Result<Vec<CachedTopic>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id, t.title,
+                    (SELECT COUNT(*) FROM posts p WHERE p.topic_id = t.id) AS posts,
+                    t.synced_at
+             FROM topics t
+             ORDER BY t.synced_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(CachedTopic {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    posts: r.get(2)?,
+                    synced_at: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// IDs of all cached topics (for `refresh-all`).
+    pub fn cached_topic_ids(&self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM topics ORDER BY id")?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+
+    /// Remove one topic's posts and its metadata row.
+    pub fn clear_topic(&self, topic_id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM posts WHERE topic_id = ?1", [topic_id])?;
+        self.conn
+            .execute("DELETE FROM topics WHERE id = ?1", [topic_id])?;
+        Ok(())
+    }
+
+    /// Wipe the entire cache.
+    pub fn clear_all(&self) -> Result<()> {
+        self.conn
+            .execute_batch("DELETE FROM posts; DELETE FROM topics;")?;
+        Ok(())
+    }
+}
+
+/// One row of the cached-topic inventory ([`Cache::list_cached`]).
+#[derive(Debug)]
+pub struct CachedTopic {
+    pub id: i64,
+    pub title: Option<String>,
+    pub posts: i64,
+    pub synced_at: Option<String>,
 }
 
 /// Columns and rows returned by [`Cache::query`]; each row is one value per
@@ -670,6 +727,48 @@ mod tests {
             format!("{err:#}").contains("no forum cache"),
             "got: {err:#}"
         );
+    }
+
+    #[test]
+    fn list_cached_reports_topics_with_post_counts() {
+        let c = Cache::open_in_memory().unwrap();
+        c.upsert_posts(7, &[post(1, 1, "a", "x"), post(2, 2, "a", "y")])
+            .unwrap();
+        c.set_topic_meta(7, Some("Topic Seven"), Some(2), 1)
+            .unwrap();
+        c.upsert_posts(8, &[post(3, 1, "b", "z")]).unwrap();
+        c.set_topic_meta(8, Some("Eight"), Some(1), 1).unwrap();
+        let list = c.list_cached().unwrap();
+        assert_eq!(list.len(), 2);
+        let seven = list.iter().find(|t| t.id == 7).unwrap();
+        assert_eq!(seven.posts, 2);
+        assert_eq!(seven.title.as_deref(), Some("Topic Seven"));
+    }
+
+    #[test]
+    fn clear_topic_and_clear_all() {
+        let c = Cache::open_in_memory().unwrap();
+        c.upsert_posts(7, &[post(1, 1, "a", "x")]).unwrap();
+        c.set_topic_meta(7, Some("S"), Some(1), 1).unwrap();
+        c.upsert_posts(8, &[post(2, 1, "b", "y")]).unwrap();
+        c.set_topic_meta(8, Some("E"), Some(1), 1).unwrap();
+
+        c.clear_topic(7).unwrap();
+        assert_eq!(c.post_count(7).unwrap(), 0);
+        assert_eq!(c.post_count(8).unwrap(), 1);
+        assert_eq!(c.list_cached().unwrap().len(), 1);
+
+        c.clear_all().unwrap();
+        assert_eq!(c.list_cached().unwrap().len(), 0);
+        assert_eq!(c.post_count(8).unwrap(), 0);
+    }
+
+    #[test]
+    fn cached_topic_ids_lists_all() {
+        let c = Cache::open_in_memory().unwrap();
+        c.set_topic_meta(7, None, None, 1).unwrap();
+        c.set_topic_meta(8, None, None, 1).unwrap();
+        assert_eq!(c.cached_topic_ids().unwrap(), vec![7, 8]);
     }
 
     #[test]

@@ -244,6 +244,21 @@ enum ForumCmd {
         #[arg(long, default_value_t = 12)]
         periods: u32,
     },
+    /// List locally cached topics (id, post count, last synced).
+    Topics,
+    /// Remove a topic from the cache, or the whole cache with --all.
+    Clear {
+        /// Numeric topic ID to remove.
+        id: Option<String>,
+        /// Clear the entire cache.
+        #[arg(long)]
+        all: bool,
+        /// Skip the confirmation prompt for --all.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Refresh every cached topic — pull new posts for each.
+    RefreshAll,
     /// Print the path to the local forum cache database.
     DbPath,
 }
@@ -381,6 +396,11 @@ async fn run() -> Result<()> {
             bucket,
             periods,
         }) => commands::forum_activity(&ctx, &id, bucket.as_str(), periods),
+        Command::Forum(ForumCmd::Topics) => commands::forum_topics(&ctx),
+        Command::Forum(ForumCmd::Clear { id, all, yes }) => {
+            commands::forum_clear(id.as_deref(), all, yes)
+        }
+        Command::Forum(ForumCmd::RefreshAll) => commands::forum_refresh_all(&ctx).await,
         Command::Forum(ForumCmd::DbPath) => commands::forum_db_path(),
 
         Command::Call {
