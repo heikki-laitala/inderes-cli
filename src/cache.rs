@@ -57,6 +57,13 @@ impl Cache {
                 path.display()
             );
         }
+        // Bring the schema up to date first — a pre-`text` cache needs the
+        // column added + backfilled, and migrate() needs a writable connection.
+        // Run that pass, then reopen read-only for the actual query, so the
+        // user's SQL still runs against a read-only connection and can't mutate
+        // the cache. Without this, `forum query "... text ..."` on an old cache
+        // would fail with "no such column: text".
+        Self::open_at(path)?;
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("opening forum cache (read-only) at {}", path.display()))?;
         Ok(Self { conn })
@@ -518,6 +525,35 @@ mod tests {
         let c = Cache::open_at(&path).unwrap();
         let r = c.query("SELECT text FROM posts WHERE id = 1").unwrap();
         assert_eq!(r.rows[0][0], json!("Hi there"));
+    }
+
+    #[test]
+    fn open_readonly_migrates_old_cache_so_text_is_queryable() {
+        // A pre-`text` cache queried via the read-only path must still be
+        // upgraded first, or `SELECT text` would fail with "no such column".
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY, topic_id INTEGER NOT NULL,
+                    post_number INTEGER, username TEXT, created_at TEXT, updated_at TEXT,
+                    cooked TEXT, raw TEXT, fetched_at TEXT);
+                 CREATE TABLE topics (id INTEGER PRIMARY KEY, title TEXT, posts_count INTEGER,
+                    last_page INTEGER NOT NULL DEFAULT 0, synced_at TEXT);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO posts (id, topic_id, cooked) VALUES (1, 7, '<p>Hi</p>')",
+                [],
+            )
+            .unwrap();
+        }
+        let ro = Cache::open_readonly_at(&path).unwrap();
+        let r = ro.query("SELECT text FROM posts WHERE id = 1").unwrap();
+        assert_eq!(r.rows[0][0], json!("Hi"));
+        // And it's still read-only.
+        assert!(ro.query("DELETE FROM posts").is_err());
     }
 
     #[test]
