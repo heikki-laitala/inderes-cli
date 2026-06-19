@@ -15,6 +15,7 @@ use clap_complete::Shell;
 use serde_json::{json, Map, Value};
 
 use crate::auth;
+use crate::cache;
 use crate::forum;
 use crate::mcp::McpClient;
 use crate::oauth::{self, IdpConfig};
@@ -246,9 +247,66 @@ pub async fn forum_search(ctx: &ToolCtx<'_>, query: &str) -> Result<()> {
     print_forum(&v, ctx.json_output, forum::render_search)
 }
 
-pub async fn forum_topic(ctx: &ToolCtx<'_>, id: &str, page: u32) -> Result<()> {
-    let v = forum_client(ctx).topic(id, page).await?;
-    print_forum(&v, ctx.json_output, forum::render_topic)
+/// Read a full topic through the local SQLite cache. On each call it resumes
+/// fetching from the last cached page (re-fetching it to catch newly-appended
+/// posts), walks until a page 404s, upserts as it goes, then renders the whole
+/// thread from the cache. A mid-walk error keeps progress and serves what's
+/// cached, so re-running resumes from the watermark.
+pub async fn forum_topic(ctx: &ToolCtx<'_>, id: &str, refresh: bool) -> Result<()> {
+    let topic_id: i64 = id
+        .parse()
+        .map_err(|_| anyhow!("invalid topic id {id:?}: expected a number"))?;
+    let cache = cache::Cache::open()?;
+    if refresh {
+        cache.clear_topic(topic_id)?;
+    }
+    let client = forum_client(ctx);
+
+    let mut page = cache.last_page(topic_id)?.max(1);
+    loop {
+        let v = match client.topic_page(id, page).await {
+            Ok(Some(v)) => v,
+            Ok(None) => break, // past the end of the thread
+            Err(e) => {
+                if cache.post_count(topic_id)? > 0 {
+                    eprintln!(
+                        "warning: forum fetch stopped at page {page} ({e:#}); \
+                         serving cached posts — re-run to resume."
+                    );
+                    break;
+                }
+                return Err(e);
+            }
+        };
+        let posts = v
+            .get("post_stream")
+            .and_then(|s| s.get("posts"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if posts.is_empty() {
+            break;
+        }
+        cache.upsert_posts(topic_id, &posts)?;
+        cache.set_topic_meta(
+            topic_id,
+            v.get("title").and_then(Value::as_str),
+            v.get("posts_count").and_then(Value::as_i64),
+            page,
+        )?;
+        page += 1;
+    }
+
+    if cache.post_count(topic_id)? == 0 {
+        bail!("forum topic {id} not found or has no posts");
+    }
+
+    let envelope = json!({
+        "id": topic_id,
+        "title": cache.topic_title(topic_id)?.unwrap_or_default(),
+        "post_stream": { "posts": cache.get_posts(topic_id)? },
+    });
+    print_forum(&envelope, ctx.json_output, forum::render_topic)
 }
 
 pub async fn forum_latest(ctx: &ToolCtx<'_>) -> Result<()> {

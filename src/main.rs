@@ -6,6 +6,7 @@
 //! subcommands. Agents discover it through an OpenClaw skill.
 
 mod auth;
+mod cache;
 mod commands;
 mod forum;
 mod mcp;
@@ -213,14 +214,15 @@ enum ForumCmd {
         /// Free-text query.
         query: String,
     },
-    /// Show a topic and its posts by numeric topic ID.
+    /// Show a full topic. Read-through cache: fetches any new posts, then
+    /// serves the whole thread from the local SQLite store.
     Topic {
         /// Numeric topic ID (the number in a /t/<slug>/<id> URL).
         id: String,
-        /// Page of posts to fetch (~20 per page, 1-based). Discourse paginates
-        /// long threads; pass 2, 3, … to read past the first page.
-        #[arg(long, default_value_t = 1)]
-        page: u32,
+        /// Re-fetch the whole thread from page 1, replacing the cached copy
+        /// (picks up edited or deleted posts).
+        #[arg(long)]
+        refresh: bool,
     },
     /// List the latest active topics.
     Latest,
@@ -333,8 +335,8 @@ async fn run() -> Result<()> {
         }) => commands::documents_read(&ctx, &document_id, sections).await,
 
         Command::Forum(ForumCmd::Search { query }) => commands::forum_search(&ctx, &query).await,
-        Command::Forum(ForumCmd::Topic { id, page }) => {
-            commands::forum_topic(&ctx, &id, page).await
+        Command::Forum(ForumCmd::Topic { id, refresh }) => {
+            commands::forum_topic(&ctx, &id, refresh).await
         }
         Command::Forum(ForumCmd::Latest) => commands::forum_latest(&ctx).await,
         Command::Forum(ForumCmd::Categories) => commands::forum_categories(&ctx).await,

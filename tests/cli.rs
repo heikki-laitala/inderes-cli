@@ -27,6 +27,7 @@ fn isolated() -> (Command, TempDir) {
     cmd.env_remove("INDERES_IDP_USERINFO_URL");
     cmd.env_remove("INDERES_IDP_CLIENT_ID");
     cmd.env_remove("INDERES_FORUM_URL");
+    cmd.env_remove("INDERES_FORUM_DB");
     (cmd, tmp)
 }
 

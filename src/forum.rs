@@ -39,7 +39,18 @@ impl<'a> ForumClient<'a> {
         }
     }
 
+    /// GET a JSON endpoint, treating 404 as an error. Used by the listing
+    /// endpoints (search/latest/categories) where a 404 is genuinely wrong.
     async fn get_json(&self, path: &str, query: &[(&str, &str)]) -> Result<Value> {
+        self.get_json_opt(path, query)
+            .await?
+            .ok_or_else(|| anyhow!("forum request to {path} returned HTTP 404 Not Found"))
+    }
+
+    /// Like `get_json` but returns `Ok(None)` on 404. Topic paging relies on
+    /// this: an out-of-range `?page` 404s, and that is the normal end-of-thread
+    /// signal, not an error.
+    async fn get_json_opt(&self, path: &str, query: &[(&str, &str)]) -> Result<Option<Value>> {
         let url = format!("{}{}", self.base, path);
         let resp = self
             .http
@@ -50,6 +61,9 @@ impl<'a> ForumClient<'a> {
             .await
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         // A 401/403 on an anonymous read is the signature of the forum being
         // switched to login-required (Discourse `login_required`). Diagnose it
         // explicitly rather than emitting a bare status. Name the actual base
@@ -74,7 +88,7 @@ impl<'a> ForumClient<'a> {
             bail!("forum request to {path} returned HTTP {status}");
         }
         let body = resp.text().await.unwrap_or_default();
-        serde_json::from_str(&body).map_err(|e| {
+        let value = serde_json::from_str(&body).map_err(|e| {
             // A 200 carrying HTML (CDN / maintenance / login interstitial) is the
             // common non-JSON case — say so instead of a bare parse error.
             if body.trim_start().starts_with('<') {
@@ -85,7 +99,8 @@ impl<'a> ForumClient<'a> {
             } else {
                 anyhow!("parsing forum JSON response from {path}: {e}")
             }
-        })
+        })?;
+        Ok(Some(value))
     }
 
     /// Full-text search across topics and posts (`/search.json?q=`).
@@ -93,10 +108,12 @@ impl<'a> ForumClient<'a> {
         self.get_json("/search.json", &[("q", query)]).await
     }
 
-    /// A single topic with its post stream (`/t/<id>.json`). `page` is 1-based;
-    /// Discourse returns ~20 posts per page, so pass 2, 3, … to walk a long
-    /// thread. Page 1 is sent without the query param so it matches the bare URL.
-    pub async fn topic(&self, id: &str, page: u32) -> Result<Value> {
+    /// Fetch one page of a topic's post stream (`/t/<id>.json`) for the
+    /// read-through cache. `page` is 1-based and ~20 posts per page; page 1
+    /// omits the query param so it matches the bare URL. `Ok(None)` means the
+    /// page is past the end (Discourse 404s out-of-range pages) — the normal
+    /// loop terminator.
+    pub async fn topic_page(&self, id: &str, page: u32) -> Result<Option<Value>> {
         // Topic ids are integers; reject anything else so a stray slug or path
         // segment fails clearly instead of producing a confusing request.
         if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
@@ -109,7 +126,7 @@ impl<'a> ForumClient<'a> {
         } else {
             Vec::new()
         };
-        self.get_json(&path, &query).await
+        self.get_json_opt(&path, &query).await
     }
 
     /// Latest active topics (`/latest.json`).
@@ -539,7 +556,11 @@ mod tests {
 
         let http = reqwest::Client::new();
         let client = ForumClient::new(&http, &server.uri());
-        let v = client.topic("123", 1).await.unwrap();
+        let v = client
+            .topic_page("123", 1)
+            .await
+            .unwrap()
+            .expect("page present");
         assert_eq!(v["id"], 123);
     }
 
@@ -561,24 +582,43 @@ mod tests {
 
         let http = reqwest::Client::new();
         let client = ForumClient::new(&http, &server.uri());
-        let v = client.topic("123", 2).await.unwrap();
+        let v = client
+            .topic_page("123", 2)
+            .await
+            .unwrap()
+            .expect("page present");
         assert_eq!(v["post_stream"]["posts"][0]["post_number"], 21);
     }
 
     #[tokio::test]
-    async fn non_success_status_is_an_error_without_body() {
+    async fn topic_page_404_signals_end_of_thread() {
+        // An out-of-range page 404s; that is the loop terminator, not an error.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/t/404.json"))
-            .respond_with(ResponseTemplate::new(404).set_body_string("<html>big error page</html>"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("<html>nope</html>"))
             .mount(&server)
             .await;
 
         let http = reqwest::Client::new();
         let client = ForumClient::new(&http, &server.uri());
-        let err = client.topic("404", 1).await.unwrap_err();
+        assert!(client.topic_page("404", 1).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn server_error_is_an_error_without_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/latest.json"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("<html>big error page</html>"))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let client = ForumClient::new(&http, &server.uri());
+        let err = client.latest().await.unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("404"), "got: {msg}");
+        assert!(msg.contains("500"), "got: {msg}");
         // The HTML body must not leak into the error.
         assert!(!msg.contains("big error page"), "got: {msg}");
     }
@@ -588,7 +628,7 @@ mod tests {
         // No network needed — validation happens before the request.
         let http = reqwest::Client::new();
         let client = ForumClient::new(&http, "https://example.com");
-        let err = client.topic("../latest", 1).await.unwrap_err();
+        let err = client.topic_page("../latest", 1).await.unwrap_err();
         assert!(
             format!("{err:#}").contains("invalid topic id"),
             "got: {err:#}"
