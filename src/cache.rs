@@ -329,6 +329,51 @@ impl Cache {
         Ok(rows)
     }
 
+    /// Momentum for a topic, anchored to *now*: the post count in the current
+    /// bucket vs the average per prior bucket over the last `periods` buckets.
+    /// Anchoring to now (rather than the topic's last active bucket) means a
+    /// dormant thread reports a current count of 0 instead of replaying an old
+    /// spike. Returns `(current, baseline_avg)`; `None` if `periods < 2`.
+    pub fn momentum(
+        &self,
+        topic_id: i64,
+        bucket: &str,
+        periods: u32,
+    ) -> Result<Option<(i64, f64)>> {
+        if periods < 2 {
+            return Ok(None);
+        }
+        // `bucket`/`periods` are validated/numeric — safe to interpolate.
+        let (cur_start, win_start) = match bucket {
+            "day" => (
+                "date('now')".to_string(),
+                format!("date('now', '-{} days')", periods - 1),
+            ),
+            "week" => {
+                let mon = "date('now', '-' || ((strftime('%w','now') + 6) % 7) || ' days')";
+                (
+                    mon.to_string(),
+                    format!("date({mon}, '-{} days')", (periods - 1) * 7),
+                )
+            }
+            "month" => (
+                "date('now','start of month')".to_string(),
+                format!("date('now','start of month','-{} months')", periods - 1),
+            ),
+            other => bail!("invalid bucket {other:?}: use day, week, or month"),
+        };
+        let sql = format!(
+            "SELECT
+                (SELECT COUNT(*) FROM posts WHERE topic_id = ?1 AND created_at >= {cur_start}),
+                (SELECT COUNT(*) FROM posts WHERE topic_id = ?1 AND created_at >= {win_start})"
+        );
+        let (current, window_total): (i64, i64) = self
+            .conn
+            .query_row(&sql, [topic_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let baseline = (window_total - current) as f64 / (periods - 1) as f64;
+        Ok(Some((current, baseline)))
+    }
+
     pub fn topic_title(&self, topic_id: i64) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -622,6 +667,39 @@ mod tests {
             "same week must be one bucket, got: {series:?}"
         );
         assert_eq!(series[0].1, 2);
+    }
+
+    #[test]
+    fn momentum_anchors_to_the_current_period() {
+        use time::format_description::well_known::Rfc3339;
+        use time::{Duration, OffsetDateTime};
+        let now = OffsetDateTime::now_utc();
+        let ts = |days: i64| (now - Duration::days(days)).format(&Rfc3339).unwrap();
+        let c = Cache::open_in_memory().unwrap();
+        c.upsert_posts(
+            7,
+            &[
+                json!({"id":1,"post_number":1,"created_at": ts(0), "cooked":"a"}),
+                json!({"id":2,"post_number":2,"created_at": ts(0), "cooked":"b"}),
+                json!({"id":3,"post_number":3,"created_at": ts(1), "cooked":"c"}),
+                json!({"id":4,"post_number":4,"created_at": ts(1), "cooked":"d"}),
+                json!({"id":5,"post_number":5,"created_at": ts(1), "cooked":"e"}),
+                json!({"id":6,"post_number":6,"created_at": ts(30), "cooked":"old"}),
+            ],
+        )
+        .unwrap();
+        // day bucket, 3 periods: current = today (2); window = last 3 days
+        // (today 2 + yesterday 3 = 5, the 30-days-ago post excluded);
+        // baseline = (5 - 2) / 2 = 1.5.
+        let (current, baseline) = c.momentum(7, "day", 3).unwrap().unwrap();
+        assert_eq!(current, 2);
+        assert!((baseline - 1.5).abs() < 1e-9, "baseline {baseline}");
+    }
+
+    #[test]
+    fn momentum_none_below_two_periods() {
+        let c = Cache::open_in_memory().unwrap();
+        assert!(c.momentum(7, "week", 1).unwrap().is_none());
     }
 
     #[test]
