@@ -559,6 +559,7 @@ pub fn forum_activity(ctx: &ToolCtx<'_>, id: &str, bucket: &str, periods: u32) -
     if series.is_empty() {
         bail!("no cached posts for topic {id} — run `inderes forum topic {id}` first");
     }
+    let mom = cache.momentum(topic_id, bucket, periods)?;
     if ctx.json_output {
         let mut obj = Map::new();
         obj.insert("bucket".into(), json!(bucket));
@@ -571,27 +572,37 @@ pub fn forum_activity(ctx: &ToolCtx<'_>, id: &str, bucket: &str, periods: u32) -
                     .collect(),
             ),
         );
-        if let Some((latest, avg, ratio)) = momentum(&series) {
+        if let Some((current, baseline)) = mom {
+            let ratio = momentum_ratio(current, baseline);
             obj.insert(
                 "momentum".into(),
                 json!({
-                    "latest": latest,
-                    "baseline_avg": (avg * 100.0).round() / 100.0,
-                    "ratio": (ratio * 100.0).round() / 100.0,
+                    "current": current,
+                    "baseline_avg": (baseline * 100.0).round() / 100.0,
+                    "ratio": ratio_json(ratio),
                 }),
             );
         }
         println!("{}", serde_json::to_string_pretty(&Value::Object(obj))?);
     } else {
         print!("{}", render_activity(topic_id, bucket, &series));
+        if let Some((current, baseline)) = mom {
+            let ratio = momentum_ratio(current, baseline);
+            println!(
+                "\nMomentum: {current} in the current {bucket} vs {baseline:.0} avg — {} ({})",
+                fmt_ratio(ratio),
+                momentum_label(ratio),
+            );
+        }
+        println!("(reflects cached posts; run `inderes forum topic` to refresh)");
     }
     Ok(())
 }
 
 /// Rank cached topics by momentum — which thread is heating up most. For each
-/// cached topic, compute its activity momentum (latest bucket vs the average of
-/// the rest) and sort descending. The cross-topic payoff of the cache: pair it
-/// with `refresh-all` to watch a whole watchlist.
+/// cached topic, compute its current-vs-baseline momentum (anchored to now, so
+/// dormant threads don't replay old spikes) and sort descending. The cross-topic
+/// payoff of the cache: pair with `refresh-all` to watch a whole watchlist.
 pub fn forum_momentum(ctx: &ToolCtx<'_>, bucket: &str, periods: u32) -> Result<()> {
     if !cache::db_path()?.exists() {
         if ctx.json_output {
@@ -602,12 +613,12 @@ pub fn forum_momentum(ctx: &ToolCtx<'_>, bucket: &str, periods: u32) -> Result<(
         return Ok(());
     }
     let cache = cache::Cache::open_readonly()?;
-    // (id, title, latest, baseline_avg, ratio)
+    // (id, title, current, baseline_avg, ratio)
     let mut ranked: Vec<(i64, Option<String>, i64, f64, f64)> = Vec::new();
     for t in cache.list_cached()? {
-        let series = cache.activity(t.id, bucket, periods)?;
-        if let Some((latest, avg, ratio)) = momentum(&series) {
-            ranked.push((t.id, t.title, latest, avg, ratio));
+        if let Some((current, baseline)) = cache.momentum(t.id, bucket, periods)? {
+            let ratio = momentum_ratio(current, baseline);
+            ranked.push((t.id, t.title, current, baseline, ratio));
         }
     }
     ranked.sort_by(|a, b| b.4.total_cmp(&a.4));
@@ -615,25 +626,26 @@ pub fn forum_momentum(ctx: &ToolCtx<'_>, bucket: &str, periods: u32) -> Result<(
     if ctx.json_output {
         let arr: Vec<Value> = ranked
             .iter()
-            .map(|(id, title, latest, avg, ratio)| {
+            .map(|(id, title, current, baseline, ratio)| {
                 json!({
-                    "id": id, "title": title, "latest": latest,
-                    "baseline_avg": (avg * 100.0).round() / 100.0,
-                    "ratio": (ratio * 100.0).round() / 100.0,
+                    "id": id, "title": title, "current": current,
+                    "baseline_avg": (baseline * 100.0).round() / 100.0,
+                    "ratio": ratio_json(*ratio),
                 })
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&Value::Array(arr))?);
     } else if ranked.is_empty() {
-        println!(
-            "Not enough cached history to rank momentum (need 2+ active {bucket}s per topic)."
-        );
+        println!("Not enough cached history to rank momentum (need --periods 2+).");
     } else {
-        println!("Cross-topic momentum (by {bucket})");
-        println!("{:>6}  {:>6}  {:>5}  topic", "ratio", "latest", "avg");
-        for (id, title, latest, avg, ratio) in &ranked {
+        println!("Cross-topic momentum (by {bucket}, current vs baseline)");
+        println!("{:>6}  {:>7}  {:>5}  topic", "ratio", "current", "avg");
+        for (id, title, current, baseline, ratio) in &ranked {
             let title = title.as_deref().unwrap_or("(untitled)");
-            println!("{ratio:>5.1}x  {latest:>6}  {avg:>5.0}  #{id} {title}");
+            println!(
+                "{:>6}  {current:>7}  {baseline:>5.0}  #{id} {title}",
+                fmt_ratio(*ratio)
+            );
         }
         println!(
             "\n(reflects cached posts; run `inderes forum refresh-all` for a current picture)"
@@ -642,24 +654,49 @@ pub fn forum_momentum(ctx: &ToolCtx<'_>, bucket: &str, periods: u32) -> Result<(
     Ok(())
 }
 
-/// `(latest_count, baseline_avg_of_earlier_periods, ratio)`. `None` with fewer
-/// than two periods (nothing to compare against).
-fn momentum(series: &[(String, i64)]) -> Option<(i64, f64, f64)> {
-    if series.len() < 2 {
-        return None;
-    }
-    let latest = series[series.len() - 1].1;
-    let earlier = &series[..series.len() - 1];
-    let avg = earlier.iter().map(|(_, n)| *n as f64).sum::<f64>() / earlier.len() as f64;
-    let ratio = if avg > 0.0 {
-        latest as f64 / avg
-    } else {
+/// Ratio of current-bucket activity to the prior-bucket baseline. Infinite for a
+/// from-nothing burst (no prior history); zero when dormant.
+fn momentum_ratio(current: i64, baseline: f64) -> f64 {
+    if baseline > 0.0 {
+        current as f64 / baseline
+    } else if current > 0 {
         f64::INFINITY
-    };
-    Some((latest, avg, ratio))
+    } else {
+        0.0
+    }
 }
 
-/// Render the activity timeline as a small bar chart plus a momentum line.
+fn momentum_label(ratio: f64) -> &'static str {
+    if ratio >= 1.5 {
+        "heating up"
+    } else if ratio <= 0.66 {
+        "cooling off"
+    } else {
+        "steady"
+    }
+}
+
+/// Human-readable ratio: "1.7x", or "new" for a from-nothing burst.
+fn fmt_ratio(ratio: f64) -> String {
+    if ratio.is_finite() {
+        format!("{ratio:.1}x")
+    } else {
+        "new".to_string()
+    }
+}
+
+/// JSON ratio: rounded number, or null when non-finite (serde_json can't
+/// represent infinity).
+fn ratio_json(ratio: f64) -> Value {
+    if ratio.is_finite() {
+        json!((ratio * 100.0).round() / 100.0)
+    } else {
+        Value::Null
+    }
+}
+
+/// Render the activity timeline as a small bar chart. The momentum line and
+/// footer are printed by the caller (it uses the current-anchored momentum).
 fn render_activity(topic_id: i64, bucket: &str, series: &[(String, i64)]) -> String {
     let mut out = format!("Activity for topic #{topic_id} (by {bucket})\n");
     let max = series.iter().map(|(_, n)| *n).max().unwrap_or(0).max(1);
@@ -667,19 +704,6 @@ fn render_activity(topic_id: i64, bucket: &str, series: &[(String, i64)]) -> Str
         let bar = "█".repeat(((*n as f64 / max as f64) * 24.0).round() as usize);
         out.push_str(&format!("{p:<10}  {n:>5}  {bar}\n"));
     }
-    if let Some((latest, avg, ratio)) = momentum(series) {
-        let label = if ratio >= 1.5 {
-            "heating up"
-        } else if ratio <= 0.66 {
-            "cooling off"
-        } else {
-            "steady"
-        };
-        out.push_str(&format!(
-            "\nMomentum: {latest} in the latest {bucket} vs {avg:.0} avg — {ratio:.1}x ({label})\n"
-        ));
-    }
-    out.push_str("(reflects cached posts; run `inderes forum topic` to refresh)\n");
     out
 }
 
@@ -1218,33 +1242,39 @@ mod tests {
     // --- momentum / render_activity ---------------------------------------
 
     #[test]
-    fn momentum_compares_latest_to_baseline() {
-        let s = vec![
-            ("w1".to_string(), 10i64),
-            ("w2".to_string(), 10),
-            ("w3".to_string(), 30),
-        ];
-        let (latest, avg, ratio) = momentum(&s).unwrap();
-        assert_eq!(latest, 30);
-        assert_eq!(avg, 10.0);
-        assert_eq!(ratio, 3.0);
+    fn momentum_ratio_handles_baseline_burst_and_dormant() {
+        assert_eq!(momentum_ratio(30, 10.0), 3.0); // heating
+        assert!(momentum_ratio(5, 0.0).is_infinite()); // from-nothing burst
+        assert_eq!(momentum_ratio(0, 4.0), 0.0); // dormant
     }
 
     #[test]
-    fn momentum_is_none_with_one_period() {
-        assert!(momentum(&[("w1".to_string(), 5i64)]).is_none());
+    fn momentum_label_buckets_the_ratio() {
+        assert_eq!(momentum_label(3.0), "heating up");
+        assert_eq!(momentum_label(1.0), "steady");
+        assert_eq!(momentum_label(0.4), "cooling off");
+        assert_eq!(momentum_label(f64::INFINITY), "heating up");
     }
 
     #[test]
-    fn render_activity_shows_bars_and_momentum_label() {
+    fn fmt_ratio_and_ratio_json_handle_infinity() {
+        assert_eq!(fmt_ratio(1.73), "1.7x");
+        assert_eq!(fmt_ratio(f64::INFINITY), "new");
+        assert_eq!(ratio_json(2.0), json!(2.0));
+        assert_eq!(ratio_json(f64::INFINITY), Value::Null);
+    }
+
+    #[test]
+    fn render_activity_shows_bars_only() {
         let s = vec![
             ("2026-W01".to_string(), 10i64),
             ("2026-W02".to_string(), 30),
         ];
         let out = render_activity(7, "week", &s);
         assert!(out.contains("topic #7"));
-        assert!(out.contains("Momentum"));
-        assert!(out.contains("heating up"), "got: {out}");
+        assert!(out.contains("2026-W02"));
+        // Momentum line is printed by the caller, not the chart renderer.
+        assert!(!out.contains("Momentum"), "got: {out}");
     }
 
     // --- render_query_table -----------------------------------------------
