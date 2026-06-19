@@ -21,6 +21,20 @@ pub enum Host {
 }
 
 impl Host {
+    /// Every supported host, for iteration.
+    pub const ALL: [Host; 3] = [Host::Openclaw, Host::Hermes, Host::Ptrclaw];
+
+    /// The value accepted by `install-skill <host>` on the CLI. Kept in sync
+    /// with clap's `ValueEnum` names (see the `cli_name_matches_clap` test) so
+    /// it's safe to pass back to a child `inderes install-skill` invocation.
+    pub fn cli_name(self) -> &'static str {
+        match self {
+            Host::Openclaw => "openclaw",
+            Host::Hermes => "hermes",
+            Host::Ptrclaw => "ptrclaw",
+        }
+    }
+
     /// The embedded SKILL.md body for this host.
     pub fn body(self) -> &'static str {
         match self {
@@ -104,5 +118,15 @@ mod tests {
     #[test]
     fn openclaw_skill_has_openclaw_metadata() {
         assert!(Host::Openclaw.body().contains("openclaw"));
+    }
+
+    #[test]
+    fn cli_name_matches_clap_value() {
+        // cli_name() is fed back to `install-skill <host>`, so it must equal the
+        // string clap accepts for each variant.
+        for h in Host::ALL {
+            let pv = h.to_possible_value().expect("variant is not skipped");
+            assert_eq!(h.cli_name(), pv.get_name(), "mismatch for {h:?}");
+        }
     }
 }

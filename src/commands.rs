@@ -492,9 +492,44 @@ pub async fn upgrade(http: &reqwest::Client, check_only: bool, force: bool) -> R
     if !status.success() {
         bail!("install script exited with {status}");
     }
+
+    // The new binary is now in place. Have *it* rewrite any installed skill
+    // files so an agent's on-disk SKILL.md matches the upgraded capabilities —
+    // this process is still the old binary and can't emit the new skill text.
+    refresh_installed_skills(&exe).await;
+
     println!();
     println!("Done. Verify with: inderes --version");
     Ok(())
+}
+
+/// After an upgrade, ask the freshly-installed binary to rewrite every skill
+/// that's currently present at its default path, so an agent reads guidance
+/// matching the new binary. Best-effort, default paths only (same scope as
+/// `uninstall --remove-skills`); a custom `--dest` install isn't tracked.
+async fn refresh_installed_skills(new_exe: &std::path::Path) {
+    use tokio::process::Command;
+    let mut refreshed_any = false;
+    for host in skill::Host::ALL {
+        let path = host.default_install_path();
+        if !path.exists() {
+            continue;
+        }
+        refreshed_any = true;
+        let name = host.cli_name();
+        match Command::new(new_exe)
+            .args(["install-skill", name, "--force"])
+            .status()
+            .await
+        {
+            Ok(s) if s.success() => println!("✓ Refreshed {name} skill at {}", path.display()),
+            Ok(s) => eprintln!("warning: refreshing {name} skill exited with {s}"),
+            Err(e) => eprintln!("warning: could not refresh {name} skill: {e:#}"),
+        }
+    }
+    if refreshed_any {
+        println!();
+    }
 }
 
 #[cfg(unix)]
@@ -555,15 +590,11 @@ async fn run_install_script(
 /// Lists the on-disk skill paths for every supported host whose skill file
 /// is currently present. Pure helper for testability.
 pub(crate) fn installed_skill_paths() -> Vec<PathBuf> {
-    [
-        skill::Host::Openclaw,
-        skill::Host::Hermes,
-        skill::Host::Ptrclaw,
-    ]
-    .into_iter()
-    .map(|h| h.default_install_path())
-    .filter(|p| p.exists())
-    .collect()
+    skill::Host::ALL
+        .into_iter()
+        .map(|h| h.default_install_path())
+        .filter(|p| p.exists())
+        .collect()
 }
 
 pub fn uninstall(yes: bool, remove_skills: bool) -> Result<()> {
