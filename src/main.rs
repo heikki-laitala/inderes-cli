@@ -244,6 +244,15 @@ enum ForumCmd {
         #[arg(long, default_value_t = 12)]
         periods: u32,
     },
+    /// Rank cached topics by momentum — which thread is heating up most.
+    Momentum {
+        /// Time bucket to group by.
+        #[arg(long, value_enum, default_value_t = Bucket::Week)]
+        bucket: Bucket,
+        /// Number of most-recent buckets to consider per topic.
+        #[arg(long, default_value_t = 12)]
+        periods: u32,
+    },
     /// List locally cached topics (id, post count, last synced).
     Topics,
     /// Remove a topic from the cache, or the whole cache with --all.
@@ -396,6 +405,9 @@ async fn run() -> Result<()> {
             bucket,
             periods,
         }) => commands::forum_activity(&ctx, &id, bucket.as_str(), periods),
+        Command::Forum(ForumCmd::Momentum { bucket, periods }) => {
+            commands::forum_momentum(&ctx, bucket.as_str(), periods)
+        }
         Command::Forum(ForumCmd::Topics) => commands::forum_topics(&ctx),
         Command::Forum(ForumCmd::Clear { id, all, yes }) => {
             commands::forum_clear(id.as_deref(), all, yes)
