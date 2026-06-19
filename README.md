@@ -153,6 +153,8 @@ inderes upgrade --force        # re-install even if already on latest
 
 The CLI queries GitHub for the latest tag, compares to the running version, and (if newer or `--force`) shells out to the same `install.sh` / `install.ps1` you'd `curl | bash`. The new binary lands in the same directory the running binary was launched from, so an upgrade preserves the install location regardless of where you originally put it.
 
+After a successful upgrade, any skill files already installed at their default paths (`~/.<host>/skills/inderes/SKILL.md`) are **automatically refreshed** — the new binary rewrites them — so an agent's on-disk guidance stays in sync with the upgraded CLI's capabilities. (A skill installed to a custom `--dest` isn't tracked; re-run `install-skill` there yourself.)
+
 `inderes upgrade --check-only` is safe to run from cron or an agent.
 
 ## Uninstall
