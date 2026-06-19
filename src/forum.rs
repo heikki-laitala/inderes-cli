@@ -50,6 +50,22 @@ impl<'a> ForumClient<'a> {
             .await
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
+        // A 401/403 on an anonymous read is the signature of the forum being
+        // switched to login-required (Discourse `login_required`). Diagnose it
+        // explicitly rather than emitting a bare status — there is nothing the
+        // user can do in this CLI to fix it (the forum's User-API-Key feature
+        // is disabled), so point them at the actual lever.
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            bail!(
+                "forum.inderes.com denied anonymous access (HTTP {status}) — the forum may now \
+                 require login. This CLI reads the forum anonymously; its User-API-Key feature \
+                 is disabled, so authenticated access isn't currently possible. Ask Inderes to \
+                 enable it."
+            );
+        }
         // Body is intentionally kept out of the error: Discourse error pages
         // can be large HTML, and we never want to splatter that at the user.
         if !status.is_success() {
@@ -439,6 +455,25 @@ mod tests {
         assert!(msg.contains("404"), "got: {msg}");
         // The HTML body must not leak into the error.
         assert!(!msg.contains("big error page"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn forbidden_is_diagnosed_as_login_required() {
+        // The signature of the forum being flipped to login-required: an
+        // anonymous read returns 403. We must explain it, not just echo 403.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/latest.json"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(r#"{"errors":["nope"]}"#))
+            .mount(&server)
+            .await;
+
+        let http = reqwest::Client::new();
+        let client = ForumClient::new(&http, &server.uri());
+        let err = client.latest().await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("require login"), "got: {msg}");
+        assert!(msg.contains("User-API-Key"), "got: {msg}");
     }
 
     #[test]
