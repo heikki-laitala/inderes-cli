@@ -40,6 +40,19 @@ Then call a friendly subcommand:
 
 Append `--json` on any subcommand to get raw JSON (easier to post-process).
 
+## Forum (public, no login)
+
+`inderes forum` reads the public Inderes forum (forum.inderes.com) directly — **no `inderes login` required**; it sends no credentials. Use it for community/retail sentiment and discussion, as distinct from analyst research.
+
+```bash
+inderes forum search "Nokia"   # full-text search across topics and posts
+inderes forum topic 74         # a topic's posts (page 1; --page N for more)
+inderes forum latest           # latest active topics
+inderes forum categories       # category list
+```
+
+Add `--json` for raw Discourse fields (`cooked` = post body HTML, `username`, `created_at`) when extracting post text for analysis. `forum topic` returns ~20 posts per page; pass `--page N` (1-based) to walk longer threads. This is separate from the authenticated MCP tool `inderes call search-forum-topics`.
+
 ## Procedure
 
 1. Parse what the user needs — fundamentals, estimates, a specific report, an event, an insider trade, etc.
