@@ -50,9 +50,11 @@ inderes forum topic 74            # full thread (read-through SQLite cache)
 inderes forum topic 74 --refresh  # re-fetch from page 1, updating edits
 inderes forum latest              # latest active topics
 inderes forum categories          # category list
+inderes forum query "<SQL>"       # read-only SQL over the cached posts
+inderes forum db-path             # path to the local SQLite cache
 ```
 
-Add `--json` for raw Discourse fields (`cooked` = post body HTML, `username`, `created_at`) when extracting post text for analysis. `forum topic` returns the **whole** thread, backed by a local SQLite read-through cache: only new posts are fetched each call, and the full thread is served from disk (first call on a huge thread is slow but resumable; re-run if interrupted). This is separate from the authenticated MCP tool `inderes call search-forum-topics`.
+Add `--json` for raw Discourse fields (`cooked` = post body HTML, `username`, `created_at`) when extracting post text for analysis. `forum topic` returns the **whole** thread, backed by a local SQLite read-through cache: only new posts are fetched each call, and the full thread is served from disk (first call on a huge thread is slow but resumable; re-run if interrupted). This is separate from the authenticated MCP tool `inderes call search-forum-topics`. Cached posts are queryable with `inderes forum query "<SQL>"` (read-only) — e.g. most active users on a stock, or posting volume over time.
 
 ## Procedure
 

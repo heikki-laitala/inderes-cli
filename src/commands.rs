@@ -369,6 +369,95 @@ fn print_forum(v: &Value, as_json: bool, render: fn(&Value) -> String) -> Result
     Ok(())
 }
 
+/// Print the path to the local forum cache DB (so you can point sqlite3 /
+/// datasette / duckdb / pandas at it).
+pub fn forum_db_path() -> Result<()> {
+    println!("{}", cache::db_path()?.display());
+    Ok(())
+}
+
+/// Run a read-only SQL query against the local forum cache. Table output by
+/// default, array-of-objects under `--json`.
+pub fn forum_query(ctx: &ToolCtx<'_>, sql: &str) -> Result<()> {
+    let cache = cache::Cache::open_readonly()?;
+    let result = cache.query(sql)?;
+    if ctx.json_output {
+        let arr: Vec<Value> = result
+            .rows
+            .iter()
+            .map(|row| {
+                let mut obj = Map::new();
+                for (col, val) in result.columns.iter().zip(row) {
+                    obj.insert(col.clone(), val.clone());
+                }
+                Value::Object(obj)
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&Value::Array(arr))?);
+    } else {
+        print!("{}", render_query_table(&result));
+    }
+    Ok(())
+}
+
+/// Render query results as a simple column-aligned text table.
+fn render_query_table(r: &cache::QueryResult) -> String {
+    if r.columns.is_empty() {
+        return "(no columns)\n".to_string();
+    }
+    let cells: Vec<Vec<String>> = r
+        .rows
+        .iter()
+        .map(|row| row.iter().map(cell_to_string).collect())
+        .collect();
+    let mut widths: Vec<usize> = r.columns.iter().map(|c| c.chars().count()).collect();
+    for row in &cells {
+        for (i, c) in row.iter().enumerate() {
+            if i < widths.len() {
+                widths[i] = widths[i].max(c.chars().count());
+            }
+        }
+    }
+    let pad = |s: &str, w: usize| format!("{s}{}", " ".repeat(w.saturating_sub(s.chars().count())));
+    let mut out = String::new();
+    let header: Vec<String> = r
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| pad(c, widths[i]))
+        .collect();
+    out.push_str(header.join("  ").trim_end());
+    out.push('\n');
+    out.push_str(
+        &widths
+            .iter()
+            .map(|w| "-".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("  "),
+    );
+    out.push('\n');
+    for row in &cells {
+        let line: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(i, c)| pad(c, *widths.get(i).unwrap_or(&0)))
+            .collect();
+        out.push_str(line.join("  ").trim_end());
+        out.push('\n');
+    }
+    let n = r.rows.len();
+    out.push_str(&format!("({n} row{})\n", if n == 1 { "" } else { "s" }));
+    out
+}
+
+fn cell_to_string(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
 // --- generic escape hatch --------------------------------------------------
 
 pub async fn call(
@@ -843,6 +932,35 @@ mod tests {
     fn build_args_empty_yields_empty_object() {
         let args = build_args(vec![], None).unwrap();
         assert_eq!(args, json!({}));
+    }
+
+    // --- render_query_table -----------------------------------------------
+
+    #[test]
+    fn render_query_table_aligns_and_counts_rows() {
+        let r = cache::QueryResult {
+            columns: vec!["username".into(), "n".into()],
+            rows: vec![
+                vec![json!("alice"), json!(2)],
+                vec![json!("bob"), json!(10)],
+            ],
+        };
+        let out = render_query_table(&r);
+        assert!(out.contains("username"));
+        assert!(out.contains("alice"));
+        assert!(out.contains("bob"));
+        assert!(out.contains("10"));
+        assert!(out.contains("(2 rows)"));
+    }
+
+    #[test]
+    fn render_query_table_handles_empty_and_null() {
+        let r = cache::QueryResult {
+            columns: vec!["a".into()],
+            rows: vec![vec![Value::Null]],
+        };
+        let out = render_query_table(&r);
+        assert!(out.contains("(1 row)"), "got: {out}");
     }
 
     // --- render_result / render_content_item ------------------------------
