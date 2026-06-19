@@ -121,6 +121,28 @@ Every tool-calling subcommand accepts `--json` to emit raw MCP output:
 inderes --json search "Nokia" | jq '.content[0].text'
 ```
 
+### Forum (public, no login)
+
+`inderes forum` reads the public [Inderes forum](https://forum.inderes.com) (a Discourse instance) directly over its JSON API. This path is **independent of the MCP server and Keycloak** — it sends no credentials and reads only public content, so it works before (and without) `inderes login`.
+
+```bash
+inderes forum search "Nokia"   # full-text search across topics and posts
+inderes forum topic 74         # a topic's posts (page 1)
+inderes forum topic 74 --page 2  # next page (~20 posts) of a long thread
+inderes forum latest           # latest active topics
+inderes forum categories       # category list
+```
+
+`--json` emits the raw Discourse fields (`cooked`, `username`, `created_at`, …), handy for scripting or downstream analysis:
+
+```bash
+inderes --json forum topic 74 | jq '.post_stream.posts[].cooked'
+```
+
+> **Why no login.** The forum is open to all, so authentication isn't required — and isn't currently possible anyway: the forum signs in via the same Keycloak but issues a Discourse session cookie rather than a reusable token, and its third-party User-API-Key feature is disabled. If the forum is ever switched to login-required, anonymous reads return 401/403 and the CLI reports that explicitly instead of failing cryptically. Point the forum base elsewhere with `INDERES_FORUM_URL`.
+>
+> **Note.** `forum topic <id>` returns ~20 posts per page; pass `--page N` (1-based) to walk a longer thread. There is no auto-fetch-all flag yet — bulk corpus retrieval is planned alongside a local cache.
+
 ## Upgrade
 
 ```bash
@@ -171,6 +193,7 @@ inderes completions powershell | Out-String | Invoke-Expression
 | Variable / flag | Purpose | Default |
 |---|---|---|
 | `--endpoint` / `INDERES_MCP_ENDPOINT` | Override the MCP HTTP endpoint | `https://mcp.inderes.com/` |
+| `INDERES_FORUM_URL` | Override the forum base URL used by `inderes forum` | `https://forum.inderes.com` |
 | `--json` | Emit raw JSON from MCP tool calls | off |
 | `-v` / `-vv` | Increase logging verbosity (`warn` → `info` → `debug`) | `warn` |
 | `INDERES_LOG` | `tracing` env filter (overrides `-v`) | unset |
@@ -200,6 +223,7 @@ Written atomically (tempfile + rename) so a crash can't leave a half-written fil
 - `src/storage.rs` — atomic-rename JSON file at the platform config dir (0600 on Unix).
 - `src/mcp.rs` — MCP 2025-03-26 Streamable HTTP client, handles both `application/json` and `text/event-stream` responses.
 - `src/commands.rs` — subcommand implementations and output formatting.
+- `src/forum.rs` — read-only Discourse JSON client for the public forum (no auth, independent of MCP).
 - `src/skill/{openclaw,hermes,ptrclaw}.md` — embedded at compile time; `inderes install-skill <host>` writes the right one to disk.
 
 ## Development
