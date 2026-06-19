@@ -155,6 +155,11 @@ datasette "$(inderes forum db-path)"  # or duckdb / sqlite3 / pandas — it's a 
 
 `forum activity <id>` buckets posts by day/week/month (`--bucket`, `--periods`) and prints a small bar chart plus a momentum read — whether the thread is heating up or cooling off (latest bucket vs the average of the rest). It's an attention signal over your cached data, so refresh the topic first for a current picture.
 
+Two tiers of analysis sit on the cache:
+
+- **Deterministic** (the CLI computes it): activity/momentum, top posters, posting volume — via `forum activity` and `forum query`. Exact, reproducible, no model.
+- **Model-judgment** (an agent does it): thread summary / catch-me-up and sentiment / bull-vs-bear, by reasoning over the clean `text` column using the recipes in the installed skills. The CLI never calls a model — it just serves the data.
+
 `forum query` opens the cache **read-only**, so a query can never modify it; table output by default, `--json` emits rows as an array of objects. The `posts` table has typed columns (`id`, `topic_id`, `post_number`, `username`, `created_at`, `cooked`, …), a **`text`** column with the HTML stripped (query this, not `cooked`, for token-cheap reading), and a `raw` column with each post's full JSON (reach any other Discourse field via `json_extract(raw, '$.score')` etc.).
 
 **Model-judgment analysis (summary, sentiment) is done by the agent, not the CLI.** The CLI just serves clean, sliceable data; an agent does the reasoning with its own model — e.g. pull the latest 40 posts' `text` to be caught up, chunk a long thread by `post_number` ranges to summarize it (map-reduce), or classify a high-`score` slice for bull-vs-bear. The installed skills include these query recipes.
