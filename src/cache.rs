@@ -226,7 +226,14 @@ impl Cache {
                     continue;
                 };
                 let cooked = p.get("cooked").and_then(Value::as_str);
-                let text = cooked.map(crate::forum::strip_html);
+                // A post may carry a pre-cleaned `text` (MCP markdown bodies,
+                // which must not be HTML-stripped); otherwise derive it from
+                // `cooked` for legacy Discourse HTML.
+                let text = p
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| cooked.map(crate::forum::strip_html));
                 stmt.execute(params![
                     id,
                     topic_id,
@@ -735,6 +742,23 @@ mod tests {
         .unwrap();
         let r = c.query("SELECT text FROM posts WHERE id = 1").unwrap();
         assert_eq!(r.rows[0][0], json!("Hello world"));
+    }
+
+    #[test]
+    fn upsert_keeps_pre_cleaned_text_verbatim() {
+        // A post carrying its own `text` (MCP markdown) must be stored as-is —
+        // not re-derived via strip_html, which would drop `< 10` / `> 5`.
+        let c = Cache::open_in_memory().unwrap();
+        c.upsert_posts(
+            7,
+            &[json!({
+                "id": 1, "post_number": 1,
+                "cooked": "P/E < 10 > 5", "text": "P/E < 10 > 5"
+            })],
+        )
+        .unwrap();
+        let r = c.query("SELECT text FROM posts WHERE id = 1").unwrap();
+        assert_eq!(r.rows[0][0], json!("P/E < 10 > 5"));
     }
 
     #[test]

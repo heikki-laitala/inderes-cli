@@ -355,7 +355,14 @@ async fn fetch_topic(
                 None => {
                     let page = forum::parse_posts_page(&structured_content(&result)?);
                     if page.posts.is_empty() {
-                        break; // empty thread, or resumed past the last post
+                        // Empty thread, or resumed past the last post. For an
+                        // already-cached topic this is a successful "no new
+                        // posts" refresh — bump synced_at (preserving the
+                        // cursor) so `forum topics` doesn't show a stale time.
+                        if cache.post_count(topic_id)? > 0 {
+                            cache.set_topic_meta(topic_id, None, None, cursor.as_deref())?;
+                        }
+                        break;
                     }
                     cache.upsert_posts(topic_id, &page.posts)?;
                     cache.set_topic_meta(

@@ -89,17 +89,22 @@ pub fn parse_posts_page(sc: &Value) -> PostsPage {
 }
 
 /// Map one `get-forum-posts` post into the row shape the cache upserts. The
-/// server's markdown `content` goes into `cooked` (where Discourse HTML used to
-/// live) so the existing renderer and `text` derivation keep working; `url`,
+/// server's markdown `content` is stored in **both** `cooked` and `text`: it is
+/// already clean, so it must NOT be HTML-stripped (stripping would treat
+/// ordinary `<`/`>` in bodies like `P/E < 10` as tags and drop text). The
+/// explicit `text` field signals "already clean" to the cache and renderer,
+/// which otherwise derive `text` via `strip_html` for legacy HTML posts. `url`,
 /// `score`, and `reply_count` are carried through so `--json`/SQL over `raw`
 /// stay useful (e.g. ranking by `score`).
 pub fn mcp_post_to_cache(p: &Value) -> Value {
+    let content = p.get("content").and_then(Value::as_str);
     json!({
         "id": p.get("id").and_then(Value::as_i64),
         "post_number": p.get("postNumber").and_then(Value::as_i64),
         "username": p.get("username").and_then(Value::as_str),
         "created_at": p.get("createdAt").and_then(Value::as_str),
-        "cooked": p.get("content").and_then(Value::as_str),
+        "cooked": content,
+        "text": content,
         "url": p.get("url").and_then(Value::as_str),
         "score": p.get("score"),
         "reply_count": p.get("replyCount"),
@@ -144,8 +149,14 @@ pub fn render_topic(v: &Value) -> String {
         let who = p.get("username").and_then(Value::as_str).unwrap_or("?");
         let when = p.get("created_at").and_then(Value::as_str).unwrap_or("");
         out.push_str(&format!("#{n} @{who} ({when}):\n"));
-        let body = p.get("cooked").and_then(Value::as_str).unwrap_or("");
-        out.push_str(&strip_html(body));
+        // Prefer the pre-cleaned `text` (MCP markdown — must not be stripped);
+        // fall back to stripping `cooked` for legacy HTML posts without it.
+        if let Some(text) = p.get("text").and_then(Value::as_str) {
+            out.push_str(text);
+        } else {
+            let body = p.get("cooked").and_then(Value::as_str).unwrap_or("");
+            out.push_str(&strip_html(body));
+        }
         out.push_str("\n\n");
     }
     out
@@ -328,9 +339,14 @@ mod tests {
         assert_eq!(row["post_number"], 1226);
         assert_eq!(row["username"], "Mustathmir");
         assert_eq!(row["created_at"], "2026-06-19T19:42:40.553Z");
-        // Markdown body lands in `cooked` (so the renderer + text column work).
+        // Markdown body lands in both `cooked` and the pre-cleaned `text`
+        // (so it is rendered/stored verbatim, never HTML-stripped).
         assert_eq!(
             row["cooked"],
+            "Nokia ja Acer ovat allekirjoittaneet sopimuksen."
+        );
+        assert_eq!(
+            row["text"],
             "Nokia ja Acer ovat allekirjoittaneet sopimuksen."
         );
         // Extras carried through for --json / SQL over raw.
@@ -445,6 +461,24 @@ mod tests {
         assert!(out.contains("Bullish on margins"));
         assert!(out.contains("#2 @bob"));
         assert!(out.contains("Disagree"));
+    }
+
+    #[test]
+    fn render_topic_does_not_html_strip_markdown_bodies() {
+        // Regression: a markdown body carries a pre-cleaned `text`. It must be
+        // rendered verbatim — `strip_html` would treat `< 10` / `> B` as tags
+        // and silently drop the surrounding text.
+        let v = json!({
+            "id": 5,
+            "title": "Valuation",
+            "post_stream": {"posts": [
+                {"post_number": 1, "username": "alice", "created_at": "2026-01-02",
+                 "cooked": "P/E < 10 and EV/EBITDA > 5",
+                 "text": "P/E < 10 and EV/EBITDA > 5"}
+            ]}
+        });
+        let out = render_topic(&v);
+        assert!(out.contains("P/E < 10 and EV/EBITDA > 5"), "got: {out}");
     }
 
     #[test]
