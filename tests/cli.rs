@@ -464,6 +464,317 @@ mod mocked {
         .stdout(predicate::str::contains("revenue 1000"));
     }
 
+    fn cmd_with_mcp_and_db(tmp: &TempDir, server: &MockServer, db: &std::path::Path) -> Command {
+        let mut cmd = cmd_with_mcp(tmp, server);
+        cmd.env("INDERES_FORUM_DB", db);
+        cmd
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn estimates_runs_end_to_end_against_mcp() {
+        let tmp = TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        mount_init(&server).await;
+        mount_tool_response(
+            &server,
+            2,
+            json!({"content": [{"type": "text", "text": "EPS 2026e: 0.42"}]}),
+        )
+        .await;
+
+        cmd_with_mcp(&tmp, &server)
+            .args(["estimates", "COMPANY:200", "--field", "eps", "--count", "3"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("EPS 2026e"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn content_list_and_get_run_end_to_end() {
+        let tmp = TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        mount_init(&server).await;
+        mount_tool_response(
+            &server,
+            2,
+            json!({"content": [{"type": "text", "text": "ARTICLE:directus-1 Outlook raised"}]}),
+        )
+        .await;
+        cmd_with_mcp(&tmp, &server)
+            .args(["content", "list", "--type", "ARTICLE"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Outlook raised"));
+
+        // A fresh server for the second invocation (mocks are one-shot).
+        let server2 = MockServer::start().await;
+        mount_init(&server2).await;
+        mount_tool_response(
+            &server2,
+            2,
+            json!({"content": [{"type": "text", "text": "# Body markdown"}]}),
+        )
+        .await;
+        cmd_with_mcp(&tmp, &server2)
+            .args([
+                "content",
+                "get",
+                "https://www.inderes.fi/fi/x",
+                "--lang",
+                "en",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Body markdown"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn documents_read_runs_end_to_end() {
+        let tmp = TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        mount_init(&server).await;
+        mount_tool_response(
+            &server,
+            2,
+            json!({"content": [{"type": "text", "text": "Section 3: Risks"}]}),
+        )
+        .await;
+        cmd_with_mcp(&tmp, &server)
+            .args(["documents", "read", "DOCUMENT:1", "--sections", "3"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Section 3"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forum_search_renders_topic_ids_from_mcp() {
+        let tmp = TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        mount_init(&server).await;
+        mount_tool_response(
+            &server,
+            2,
+            json!({
+                "structuredContent": {"topics": [
+                    {"title": "Nokia sijoituskohteena (Osa 4)", "postsCount": 1176,
+                     "url": "https://forum.inderes.com/t/nokia-osa-4/73687"}
+                ]},
+                "content": [{"type": "text", "text": "ignored"}]
+            }),
+        )
+        .await;
+        cmd_with_mcp(&tmp, &server)
+            .args(["forum", "search", "Nokia"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("#73687"))
+            .stdout(predicate::str::contains("1176 posts"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forum_topic_caches_then_cache_commands_read_it() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("forum.db");
+        let server = MockServer::start().await;
+        mount_init(&server).await;
+        // One page, no next page: caches the posts and stops.
+        mount_tool_response(
+            &server,
+            2,
+            json!({
+                "structuredContent": {
+                    "posts": [
+                        {"id": 1, "postNumber": 1, "username": "alice",
+                         "createdAt": "2026-01-02T00:00:00Z", "content": "Bullish",
+                         "url": "https://forum.inderes.com/t/-/74/1", "score": 5, "replyCount": 0},
+                        {"id": 2, "postNumber": 2, "username": "bob",
+                         "createdAt": "2026-01-03T00:00:00Z", "content": "Bearish",
+                         "url": "https://forum.inderes.com/t/-/74/2", "score": 1, "replyCount": 0}
+                    ],
+                    "pageInfo": {"endCursor": "2", "hasNextPage": false, "totalPosts": 2}
+                }
+            }),
+        )
+        .await;
+
+        // 1) Fetch the thread → caches it and renders the bodies.
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args(["forum", "topic", "74"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Bullish"))
+            .stdout(predicate::str::contains("@bob"));
+
+        // 2) `forum topics` lists the cached inventory (no server needed).
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args(["forum", "topics"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("#74"))
+            .stdout(predicate::str::contains("2 posts"));
+
+        // 3) `forum query` runs read-only SQL over the cached posts.
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args([
+                "forum",
+                "query",
+                "SELECT username FROM posts ORDER BY post_number",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("alice"))
+            .stdout(predicate::str::contains("bob"));
+
+        // 4) `forum momentum` ranks cached topics (deterministic, no model).
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args(["forum", "momentum"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("#74"));
+
+        // 5) `forum activity` buckets the cached posts over time.
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args(["forum", "activity", "74", "--bucket", "month"])
+            .assert()
+            .success();
+
+        // 5b) `--json` variants exercise the structured-output branches.
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args(["--json", "forum", "query", "SELECT username FROM posts"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("\"username\""));
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args(["--json", "forum", "activity", "74", "--bucket", "month"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("\"periods\""));
+
+        // 6) `forum db-path` prints the cache location.
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args(["forum", "db-path"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("forum.db"));
+
+        // 7) `forum refresh-all` re-walks each cached topic; a fresh server
+        //    serves an empty page (already caught up) → no new posts.
+        let server2 = MockServer::start().await;
+        mount_init(&server2).await;
+        mount_tool_response(
+            &server2,
+            2,
+            json!({"structuredContent": {"posts": [], "pageInfo": {"hasNextPage": false}}}),
+        )
+        .await;
+        cmd_with_mcp_and_db(&tmp, &server2, &db)
+            .args(["forum", "refresh-all"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("+0 new"));
+
+        // 8) `forum clear` argument validation (cache exists, so these reach
+        //    the conflict/empty-arg branches rather than the no-cache early-out).
+        cmd_with_mcp_and_db(&tmp, &server2, &db)
+            .args(["forum", "clear", "74", "--all"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("not both"));
+        cmd_with_mcp_and_db(&tmp, &server2, &db)
+            .args(["forum", "clear"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("specify a topic id"));
+
+        // 9) `forum clear <id>` drops one topic; `--all --yes` wipes the rest.
+        cmd_with_mcp_and_db(&tmp, &server2, &db)
+            .args(["forum", "clear", "74"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Cleared topic 74"));
+        cmd_with_mcp_and_db(&tmp, &server2, &db)
+            .args(["forum", "clear", "--all", "--yes"])
+            .assert()
+            .success();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forum_topic_with_no_posts_reports_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("forum.db");
+        let server = MockServer::start().await;
+        mount_init(&server).await;
+        // Empty thread (or deleted/private topic): no posts, nothing cached.
+        mount_tool_response(
+            &server,
+            2,
+            json!({"structuredContent": {"posts": [], "pageInfo": {"hasNextPage": false}}}),
+        )
+        .await;
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args(["forum", "topic", "999999"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("not found or has no posts"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forum_cache_commands_are_graceful_without_a_cache() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("missing.db");
+        let server = MockServer::start().await;
+
+        // Inventory / momentum report "no cached topics" rather than erroring.
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args(["forum", "topics"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No cached topics"));
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args(["forum", "momentum"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("No cached topics"));
+        // --json variants emit an empty array.
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args(["--json", "forum", "topics"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("[]"));
+
+        // db-path prints the location plus a "no cache yet" hint on stderr.
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args(["forum", "db-path"])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("no cache yet"));
+
+        // query/activity need a populated cache and say so.
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args(["forum", "query", "SELECT 1"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("no forum cache"));
+        cmd_with_mcp_and_db(&tmp, &server, &db)
+            .args(["forum", "activity", "1"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("no forum cache"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn whoami_with_valid_token_reports_signed_in() {
+        let tmp = TempDir::new().unwrap();
+        let server = MockServer::start().await;
+        // whoami (non-verbose) reads the stored token's expiry and makes no
+        // network call; seed a valid token and expect a signed-in message.
+        cmd_with_mcp(&tmp, &server)
+            .arg("whoami")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Signed in"));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn json_flag_emits_raw_tool_result() {
         let tmp = TempDir::new().unwrap();

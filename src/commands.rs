@@ -155,14 +155,15 @@ pub async fn search(ctx: &ToolCtx<'_>, query: &str) -> Result<()> {
         .await
 }
 
-pub async fn fundamentals(
-    ctx: &ToolCtx<'_>,
+/// Build the `get-fundamentals` arguments. Pure so the arg shape is testable
+/// without a live MCP call; the async wrapper just forwards it.
+fn fundamentals_args(
     company_ids: Vec<String>,
     resolution: &str,
     fields: Vec<String>,
     start_year: Option<i32>,
     end_year: Option<i32>,
-) -> Result<()> {
+) -> Value {
     let mut args = Map::new();
     args.insert(
         "companyIds".into(),
@@ -181,17 +182,29 @@ pub async fn fundamentals(
     if let Some(y) = end_year {
         args.insert("endYear".into(), y.into());
     }
-    ctx.call("get-fundamentals", Value::Object(args)).await
+    Value::Object(args)
 }
 
-pub async fn estimates(
+pub async fn fundamentals(
     ctx: &ToolCtx<'_>,
+    company_ids: Vec<String>,
+    resolution: &str,
+    fields: Vec<String>,
+    start_year: Option<i32>,
+    end_year: Option<i32>,
+) -> Result<()> {
+    let args = fundamentals_args(company_ids, resolution, fields, start_year, end_year);
+    ctx.call("get-fundamentals", args).await
+}
+
+/// Build the `get-inderes-estimates` arguments.
+fn estimates_args(
     company_ids: Vec<String>,
     fields: Vec<String>,
     count: u32,
     quarters: bool,
     year_count: u32,
-) -> Result<()> {
+) -> Value {
     let mut args = Map::new();
     if !company_ids.is_empty() {
         args.insert(
@@ -206,16 +219,28 @@ pub async fn estimates(
     args.insert("count".into(), count.into());
     args.insert("includeQuarters".into(), quarters.into());
     args.insert("yearCount".into(), year_count.into());
-    ctx.call("get-inderes-estimates", Value::Object(args)).await
+    Value::Object(args)
 }
 
-pub async fn content_list(
+pub async fn estimates(
     ctx: &ToolCtx<'_>,
+    company_ids: Vec<String>,
+    fields: Vec<String>,
+    count: u32,
+    quarters: bool,
+    year_count: u32,
+) -> Result<()> {
+    let args = estimates_args(company_ids, fields, count, quarters, year_count);
+    ctx.call("get-inderes-estimates", args).await
+}
+
+/// Build the `list-content` arguments.
+fn content_list_args(
     company_id: Option<String>,
     types: Vec<String>,
     first: u32,
     after: Option<String>,
-) -> Result<()> {
+) -> Value {
     let mut args = Map::new();
     if let Some(c) = company_id {
         args.insert("companyId".into(), c.into());
@@ -230,10 +255,23 @@ pub async fn content_list(
     if let Some(c) = after {
         args.insert("after".into(), c.into());
     }
-    ctx.call("list-content", Value::Object(args)).await
+    Value::Object(args)
 }
 
-pub async fn content_get(ctx: &ToolCtx<'_>, id_or_url: &str, lang: Option<String>) -> Result<()> {
+pub async fn content_list(
+    ctx: &ToolCtx<'_>,
+    company_id: Option<String>,
+    types: Vec<String>,
+    first: u32,
+    after: Option<String>,
+) -> Result<()> {
+    let args = content_list_args(company_id, types, first, after);
+    ctx.call("list-content", args).await
+}
+
+/// Build the `get-content` arguments — a URL goes to `url`, anything else is
+/// treated as a content id.
+fn content_get_args(id_or_url: &str, lang: Option<String>) -> Value {
     let mut args = Map::new();
     if id_or_url.starts_with("http://") || id_or_url.starts_with("https://") {
         args.insert("url".into(), id_or_url.into());
@@ -243,7 +281,23 @@ pub async fn content_get(ctx: &ToolCtx<'_>, id_or_url: &str, lang: Option<String
     if let Some(l) = lang {
         args.insert("lang".into(), l.into());
     }
-    ctx.call("get-content", Value::Object(args)).await
+    Value::Object(args)
+}
+
+pub async fn content_get(ctx: &ToolCtx<'_>, id_or_url: &str, lang: Option<String>) -> Result<()> {
+    ctx.call("get-content", content_get_args(id_or_url, lang))
+        .await
+}
+
+/// Build the `list-company-documents` arguments.
+fn documents_list_args(company_id: &str, first: u32, after: Option<String>) -> Value {
+    let mut args = Map::new();
+    args.insert("companyId".into(), company_id.into());
+    args.insert("first".into(), first.into());
+    if let Some(c) = after {
+        args.insert("after".into(), c.into());
+    }
+    Value::Object(args)
 }
 
 pub async fn documents_list(
@@ -252,14 +306,11 @@ pub async fn documents_list(
     first: u32,
     after: Option<String>,
 ) -> Result<()> {
-    let mut args = Map::new();
-    args.insert("companyId".into(), company_id.into());
-    args.insert("first".into(), first.into());
-    if let Some(c) = after {
-        args.insert("after".into(), c.into());
-    }
-    ctx.call("list-company-documents", Value::Object(args))
-        .await
+    ctx.call(
+        "list-company-documents",
+        documents_list_args(company_id, first, after),
+    )
+    .await
 }
 
 pub async fn documents_get(ctx: &ToolCtx<'_>, document_id: &str) -> Result<()> {
@@ -341,59 +392,91 @@ async fn fetch_topic(
     ctx: &ToolCtx<'_>,
     cache: &cache::Cache,
     topic_id: i64,
-    mut cursor: Option<String>,
+    cursor: Option<String>,
 ) -> Result<bool> {
-    let url = forum::thread_url(topic_id);
     let mut client = ctx.client().await?;
+    let mut fetcher = McpPageFetcher {
+        client: &mut client,
+        url: forum::thread_url(topic_id),
+    };
+    let result = walk_thread(cache, topic_id, cursor, &mut fetcher).await;
+    let _ = client.close().await;
+    result
+}
+
+/// A source of forward thread pages — the MCP `get-forum-posts` tool in
+/// production, a canned list in tests. A fetch failure (transport error or an
+/// `isError` result, or a deleted/private topic) is surfaced as `Err`; the walk
+/// decides whether to serve cached posts or propagate.
+trait PageFetcher {
+    async fn fetch_page(&mut self, cursor: Option<&str>) -> Result<forum::PostsPage>;
+}
+
+/// Production [`PageFetcher`]: one `get-forum-posts` call per page.
+struct McpPageFetcher<'a> {
+    client: &'a mut McpClient,
+    url: String,
+}
+
+impl PageFetcher for McpPageFetcher<'_> {
+    async fn fetch_page(&mut self, cursor: Option<&str>) -> Result<forum::PostsPage> {
+        let args = forum::page_request_args(&self.url, cursor);
+        let result = self.client.call_tool("get-forum-posts", args).await?;
+        if let Some(msg) = result_error_text(&result) {
+            bail!("{msg}");
+        }
+        Ok(forum::parse_posts_page(&structured_content(&result)?))
+    }
+}
+
+/// Walk a thread forward from `cursor` (`None` = from the start), upserting each
+/// page into the cache and advancing the stored resume cursor. Returns whether
+/// the walk was interrupted: a fetch failure stops the walk and, if posts are
+/// already cached, serves them and warns (`Ok(true)`) rather than erroring. The
+/// walk stops when the source reports no further pages (or returns an empty
+/// page, i.e. we're already caught up). Generic over [`PageFetcher`] so the
+/// pagination/resume/interrupt logic is unit-testable without a live server.
+async fn walk_thread<F: PageFetcher>(
+    cache: &cache::Cache,
+    topic_id: i64,
+    mut cursor: Option<String>,
+    fetcher: &mut F,
+) -> Result<bool> {
     loop {
-        let args = forum::page_request_args(&url, cursor.as_deref());
-        // A transport error or an `isError` result is a fetch failure: serve
-        // cached posts (with a warning) when we have any, else propagate.
-        let fail = match client.call_tool("get-forum-posts", args).await {
-            Ok(result) => match result_error_text(&result) {
-                Some(msg) => Some(msg),
-                None => {
-                    let page = forum::parse_posts_page(&structured_content(&result)?);
-                    if page.posts.is_empty() {
-                        // Empty thread, or resumed past the last post. For an
-                        // already-cached topic this is a successful "no new
-                        // posts" refresh — bump synced_at (preserving the
-                        // cursor) so `forum topics` doesn't show a stale time.
-                        if cache.post_count(topic_id)? > 0 {
-                            cache.set_topic_meta(topic_id, None, None, cursor.as_deref())?;
-                        }
-                        break;
-                    }
-                    cache.upsert_posts(topic_id, &page.posts)?;
-                    cache.set_topic_meta(
-                        topic_id,
-                        None,
-                        page.total_posts,
-                        page.next_cursor.as_deref(),
-                    )?;
-                    cursor = page.next_cursor;
-                    if !page.has_next {
-                        break;
-                    }
-                    None
+        let page = match fetcher.fetch_page(cursor.as_deref()).await {
+            Ok(page) => page,
+            Err(e) => {
+                if cache.post_count(topic_id)? > 0 {
+                    eprintln!(
+                        "warning: forum fetch for topic {topic_id} stopped ({e:#}); \
+                         serving cached posts — re-run to resume."
+                    );
+                    return Ok(true);
                 }
-            },
-            Err(e) => Some(format!("{e:#}")),
-        };
-        if let Some(msg) = fail {
-            let _ = client.close().await;
-            if cache.post_count(topic_id)? > 0 {
-                eprintln!(
-                    "warning: forum fetch for topic {topic_id} stopped ({msg}); \
-                     serving cached posts — re-run to resume."
-                );
-                return Ok(true);
+                return Err(e.context(format!("fetching forum topic {topic_id}")));
             }
-            bail!("fetching forum topic {topic_id}: {msg}");
+        };
+        if page.posts.is_empty() {
+            // Empty thread, or resumed past the last post. For an already-cached
+            // topic this is a successful "no new posts" refresh — bump synced_at
+            // (preserving the cursor) so `forum topics` isn't stale.
+            if cache.post_count(topic_id)? > 0 {
+                cache.set_topic_meta(topic_id, None, None, cursor.as_deref())?;
+            }
+            return Ok(false);
+        }
+        cache.upsert_posts(topic_id, &page.posts)?;
+        cache.set_topic_meta(
+            topic_id,
+            None,
+            page.total_posts,
+            page.next_cursor.as_deref(),
+        )?;
+        cursor = page.next_cursor;
+        if !page.has_next {
+            return Ok(false);
         }
     }
-    let _ = client.close().await;
-    Ok(false)
 }
 
 /// Print a forum response: raw pretty JSON under `--json`, otherwise the
@@ -1194,6 +1277,230 @@ fn _stable_map_type() -> HashMap<String, Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::VecDeque;
+
+    // --- walk_thread (pagination / resume / interrupt) ---------------------
+
+    /// A [`PageFetcher`] that hands back queued pages (or errors), recording the
+    /// cursor it was asked for on each call so resume behavior can be asserted.
+    struct CannedFetcher {
+        pages: VecDeque<Result<forum::PostsPage>>,
+        seen_cursors: Vec<Option<String>>,
+    }
+
+    impl CannedFetcher {
+        fn new(pages: Vec<Result<forum::PostsPage>>) -> Self {
+            Self {
+                pages: pages.into_iter().collect(),
+                seen_cursors: Vec::new(),
+            }
+        }
+    }
+
+    impl PageFetcher for CannedFetcher {
+        async fn fetch_page(&mut self, cursor: Option<&str>) -> Result<forum::PostsPage> {
+            self.seen_cursors.push(cursor.map(str::to_string));
+            self.pages
+                .pop_front()
+                .expect("walk_thread requested more pages than were queued")
+        }
+    }
+
+    fn page(posts: Vec<Value>, next: Option<&str>, has_next: bool) -> forum::PostsPage {
+        forum::PostsPage {
+            posts,
+            next_cursor: next.map(str::to_string),
+            has_next,
+            total_posts: None,
+        }
+    }
+
+    fn cache_post(id: i64, n: i64) -> Value {
+        json!({"id": id, "post_number": n, "username": "u", "created_at": "2026-01-01",
+               "cooked": "body", "text": "body"})
+    }
+
+    #[tokio::test]
+    async fn walk_thread_caches_all_pages_until_no_next() {
+        let c = cache::Cache::open_in_memory().unwrap();
+        let mut f = CannedFetcher::new(vec![
+            Ok(page(
+                vec![cache_post(1, 1), cache_post(2, 2)],
+                Some("c1"),
+                true,
+            )),
+            Ok(page(vec![cache_post(3, 3)], Some("c2"), false)),
+        ]);
+        let interrupted = walk_thread(&c, 7, None, &mut f).await.unwrap();
+        assert!(!interrupted);
+        assert_eq!(c.post_count(7).unwrap(), 3);
+        // Cursor advanced to the last page, and the second fetch resumed from
+        // the first page's endCursor.
+        assert_eq!(c.topic_cursor(7).unwrap().as_deref(), Some("c2"));
+        assert_eq!(f.seen_cursors, vec![None, Some("c1".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn walk_thread_resumes_from_stored_cursor_and_marks_caught_up() {
+        let c = cache::Cache::open_in_memory().unwrap();
+        c.upsert_posts(7, &[cache_post(1, 1)]).unwrap();
+        c.set_topic_meta(7, Some("T"), Some(1), Some("c5")).unwrap();
+        // Already caught up: the resume fetch returns an empty page.
+        let mut f = CannedFetcher::new(vec![Ok(page(vec![], Some("c5"), false))]);
+        let interrupted = walk_thread(&c, 7, Some("c5".into()), &mut f).await.unwrap();
+        assert!(!interrupted);
+        assert_eq!(f.seen_cursors, vec![Some("c5".to_string())]);
+        // No growth, cursor preserved (synced_at bumped — covers that branch).
+        assert_eq!(c.post_count(7).unwrap(), 1);
+        assert_eq!(c.topic_cursor(7).unwrap().as_deref(), Some("c5"));
+    }
+
+    #[tokio::test]
+    async fn walk_thread_interrupted_serves_cached_posts() {
+        let c = cache::Cache::open_in_memory().unwrap();
+        c.upsert_posts(7, &[cache_post(1, 1)]).unwrap();
+        let mut f = CannedFetcher::new(vec![Err(anyhow!("rate limited"))]);
+        let interrupted = walk_thread(&c, 7, Some("c".into()), &mut f).await.unwrap();
+        assert!(interrupted, "a failure with cached posts should serve them");
+        assert_eq!(c.post_count(7).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn walk_thread_error_without_cache_propagates() {
+        let c = cache::Cache::open_in_memory().unwrap();
+        let mut f = CannedFetcher::new(vec![Err(anyhow!("boom"))]);
+        let err = walk_thread(&c, 7, None, &mut f).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("fetching forum topic 7"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn walk_thread_empty_first_page_leaves_topic_uncached() {
+        // An empty thread (or nonexistent topic) creates no metadata row, so
+        // `refresh-all` won't later try to download a phantom topic.
+        let c = cache::Cache::open_in_memory().unwrap();
+        let mut f = CannedFetcher::new(vec![Ok(page(vec![], None, false))]);
+        let interrupted = walk_thread(&c, 7, None, &mut f).await.unwrap();
+        assert!(!interrupted);
+        assert_eq!(c.post_count(7).unwrap(), 0);
+        assert_eq!(c.topic_cursor(7).unwrap(), None);
+    }
+
+    // --- subcommand arg builders -------------------------------------------
+
+    #[test]
+    fn fundamentals_args_includes_optional_fields_only_when_set() {
+        let a = fundamentals_args(
+            vec!["COMPANY:200".into()],
+            "ANNUAL",
+            vec!["revenue".into()],
+            Some(2020),
+            None,
+        );
+        assert_eq!(a["companyIds"], json!(["COMPANY:200"]));
+        assert_eq!(a["resolution"], "ANNUAL");
+        assert_eq!(a["fields"], json!(["revenue"]));
+        assert_eq!(a["startYear"], 2020);
+        assert!(a.get("endYear").is_none());
+
+        // Empty fields are omitted entirely.
+        let a = fundamentals_args(vec!["COMPANY:1".into()], "QUARTERLY", vec![], None, None);
+        assert!(a.get("fields").is_none());
+        assert!(a.get("startYear").is_none());
+    }
+
+    #[test]
+    fn estimates_args_omits_empty_company_ids_but_always_sends_scalars() {
+        let a = estimates_args(vec![], vec!["eps".into()], 5, true, 3);
+        assert!(a.get("companyIds").is_none());
+        assert_eq!(a["fields"], json!(["eps"]));
+        assert_eq!(a["count"], 5);
+        assert_eq!(a["includeQuarters"], true);
+        assert_eq!(a["yearCount"], 3);
+
+        let a = estimates_args(vec!["COMPANY:9".into()], vec![], 1, false, 1);
+        assert_eq!(a["companyIds"], json!(["COMPANY:9"]));
+        assert_eq!(a["fields"], json!([]));
+    }
+
+    #[test]
+    fn content_list_args_includes_only_present_filters() {
+        let a = content_list_args(Some("COMPANY:200".into()), vec!["ARTICLE".into()], 20, None);
+        assert_eq!(a["companyId"], "COMPANY:200");
+        assert_eq!(a["types"], json!(["ARTICLE"]));
+        assert_eq!(a["first"], 20);
+        assert!(a.get("after").is_none());
+
+        let a = content_list_args(None, vec![], 10, Some("cursor123".into()));
+        assert!(a.get("companyId").is_none());
+        assert!(a.get("types").is_none());
+        assert_eq!(a["after"], "cursor123");
+    }
+
+    #[test]
+    fn content_get_args_routes_url_vs_content_id() {
+        let url = content_get_args("https://www.inderes.fi/fi/article", Some("en".into()));
+        assert_eq!(url["url"], "https://www.inderes.fi/fi/article");
+        assert!(url.get("contentId").is_none());
+        assert_eq!(url["lang"], "en");
+
+        let id = content_get_args("ARTICLE:directus-1234", None);
+        assert_eq!(id["contentId"], "ARTICLE:directus-1234");
+        assert!(id.get("url").is_none());
+        assert!(id.get("lang").is_none());
+    }
+
+    #[test]
+    fn documents_list_args_carries_pagination() {
+        let a = documents_list_args("COMPANY:200", 15, Some("c1".into()));
+        assert_eq!(a["companyId"], "COMPANY:200");
+        assert_eq!(a["first"], 15);
+        assert_eq!(a["after"], "c1");
+        assert!(documents_list_args("COMPANY:1", 5, None)
+            .get("after")
+            .is_none());
+    }
+
+    // --- structured_content / result_error_text ---------------------------
+
+    #[test]
+    fn structured_content_prefers_structured_field() {
+        let result = json!({
+            "content": [{"type": "text", "text": "{\"ignored\":true}"}],
+            "structuredContent": {"posts": [], "pageInfo": {"hasNextPage": false}}
+        });
+        let sc = structured_content(&result).unwrap();
+        assert!(sc.get("pageInfo").is_some());
+        assert!(sc.get("ignored").is_none());
+    }
+
+    #[test]
+    fn structured_content_falls_back_to_parsing_text() {
+        let result = json!({"content": [{"type": "text", "text": "{\"topics\":[{\"id\":1}]}"}]});
+        let sc = structured_content(&result).unwrap();
+        assert_eq!(sc["topics"][0]["id"], 1);
+    }
+
+    #[test]
+    fn structured_content_errors_without_structured_or_text() {
+        let err = structured_content(&json!({"content": []})).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no structuredContent"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn result_error_text_some_only_on_is_error() {
+        assert_eq!(result_error_text(&json!({"content": []})), None);
+        let msg = result_error_text(&json!({
+            "isError": true,
+            "content": [{"type": "text", "text": "tool blew up"}]
+        }));
+        assert_eq!(msg.as_deref(), Some("tool blew up"));
+    }
 
     // --- build_args --------------------------------------------------------
 
