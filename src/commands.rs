@@ -405,11 +405,14 @@ async fn fetch_topic(
 }
 
 /// A source of forward thread pages — the MCP `get-forum-posts` tool in
-/// production, a canned list in tests. A fetch failure (transport error or an
-/// `isError` result, or a deleted/private topic) is surfaced as `Err`; the walk
-/// decides whether to serve cached posts or propagate.
+/// production, a canned list in tests. Returns the **raw result envelope**;
+/// `Err` is reserved for *recoverable* fetch failures (transport error or an
+/// `isError` result — e.g. a deleted/private topic), on which the walk may
+/// serve cached posts. A malformed-but-successful envelope is NOT an error
+/// here: the walk parses it and lets a shape/parse failure propagate loudly,
+/// rather than masking a schema change by serving stale cache.
 trait PageFetcher {
-    async fn fetch_page(&mut self, cursor: Option<&str>) -> Result<forum::PostsPage>;
+    async fn fetch_page(&mut self, cursor: Option<&str>) -> Result<Value>;
 }
 
 /// Production [`PageFetcher`]: one `get-forum-posts` call per page.
@@ -419,13 +422,13 @@ struct McpPageFetcher<'a> {
 }
 
 impl PageFetcher for McpPageFetcher<'_> {
-    async fn fetch_page(&mut self, cursor: Option<&str>) -> Result<forum::PostsPage> {
+    async fn fetch_page(&mut self, cursor: Option<&str>) -> Result<Value> {
         let args = forum::page_request_args(&self.url, cursor);
         let result = self.client.call_tool("get-forum-posts", args).await?;
         if let Some(msg) = result_error_text(&result) {
             bail!("{msg}");
         }
-        Ok(forum::parse_posts_page(&structured_content(&result)?))
+        Ok(result)
     }
 }
 
@@ -443,8 +446,12 @@ async fn walk_thread<F: PageFetcher>(
     fetcher: &mut F,
 ) -> Result<bool> {
     loop {
-        let page = match fetcher.fetch_page(cursor.as_deref()).await {
-            Ok(page) => page,
+        // Only recoverable fetch failures (transport / `isError`) fall back to
+        // cached posts. A successful-but-malformed envelope is parsed below and
+        // its shape/parse error propagates loudly — masking a schema change by
+        // serving stale cache would hide the breakage.
+        let result = match fetcher.fetch_page(cursor.as_deref()).await {
+            Ok(result) => result,
             Err(e) => {
                 if cache.post_count(topic_id)? > 0 {
                     eprintln!(
@@ -456,6 +463,7 @@ async fn walk_thread<F: PageFetcher>(
                 return Err(e.context(format!("fetching forum topic {topic_id}")));
             }
         };
+        let page = forum::parse_posts_page(&structured_content(&result)?);
         if page.posts.is_empty() {
             // Empty thread, or resumed past the last post. For an already-cached
             // topic this is a successful "no new posts" refresh — bump synced_at
@@ -1281,15 +1289,16 @@ mod tests {
 
     // --- walk_thread (pagination / resume / interrupt) ---------------------
 
-    /// A [`PageFetcher`] that hands back queued pages (or errors), recording the
-    /// cursor it was asked for on each call so resume behavior can be asserted.
+    /// A [`PageFetcher`] that hands back queued result envelopes (or recoverable
+    /// errors), recording the cursor it was asked for on each call so resume
+    /// behavior can be asserted.
     struct CannedFetcher {
-        pages: VecDeque<Result<forum::PostsPage>>,
+        pages: VecDeque<Result<Value>>,
         seen_cursors: Vec<Option<String>>,
     }
 
     impl CannedFetcher {
-        fn new(pages: Vec<Result<forum::PostsPage>>) -> Self {
+        fn new(pages: Vec<Result<Value>>) -> Self {
             Self {
                 pages: pages.into_iter().collect(),
                 seen_cursors: Vec::new(),
@@ -1298,7 +1307,7 @@ mod tests {
     }
 
     impl PageFetcher for CannedFetcher {
-        async fn fetch_page(&mut self, cursor: Option<&str>) -> Result<forum::PostsPage> {
+        async fn fetch_page(&mut self, cursor: Option<&str>) -> Result<Value> {
             self.seen_cursors.push(cursor.map(str::to_string));
             self.pages
                 .pop_front()
@@ -1306,13 +1315,14 @@ mod tests {
         }
     }
 
-    fn page(posts: Vec<Value>, next: Option<&str>, has_next: bool) -> forum::PostsPage {
-        forum::PostsPage {
-            posts,
-            next_cursor: next.map(str::to_string),
-            has_next,
-            total_posts: None,
-        }
+    /// A `get-forum-posts` result envelope wrapping one page of `posts`.
+    fn page(posts: Vec<Value>, next: Option<&str>, has_next: bool) -> Value {
+        json!({
+            "structuredContent": {
+                "posts": posts,
+                "pageInfo": { "endCursor": next, "hasNextPage": has_next }
+            }
+        })
     }
 
     fn cache_post(id: i64, n: i64) -> Value {
@@ -1372,6 +1382,26 @@ mod tests {
         let err = walk_thread(&c, 7, None, &mut f).await.unwrap_err();
         assert!(
             format!("{err:#}").contains("fetching forum topic 7"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn walk_thread_malformed_page_propagates_even_with_cache() {
+        // A *successful* but unparseable envelope is a schema/corruption signal,
+        // not a transient failure: it must fail loudly rather than silently
+        // serving stale cached posts. Regression guard for the walk_thread
+        // extraction (Codex #30).
+        let c = cache::Cache::open_in_memory().unwrap();
+        c.upsert_posts(7, &[cache_post(1, 1)]).unwrap();
+        // Ok(...) = the fetch "succeeded", but the envelope has no
+        // structuredContent / text content to parse.
+        let mut f = CannedFetcher::new(vec![Ok(json!({"unexpected": true}))]);
+        let err = walk_thread(&c, 7, Some("c".into()), &mut f)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no structuredContent"),
             "got: {err:#}"
         );
     }
