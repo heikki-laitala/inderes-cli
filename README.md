@@ -246,11 +246,16 @@ Written atomically (tempfile + rename) so a crash can't leave a half-written fil
         │                    │
         ▼                    ▼
      SKILL.md ──shells──▶ inderes ──OAuth──▶ sso.inderes.fi (Keycloak)
-                             │
-                             │ Bearer + JSON-RPC
-                             ▼
-                        mcp.inderes.com  (Streamable-HTTP MCP)
+                          │  │
+       forum-cache.db ◀───┘  │ Bearer + JSON-RPC
+      (SQLite, local         ▼
+       read-through)    mcp.inderes.com  (Streamable-HTTP MCP)
 ```
+
+`inderes forum` reads through `mcp.inderes.com` like every other command.
+`get-forum-posts` thread posts are persisted to the local `forum-cache.db`
+so a thread is downloaded once and then served and queried from disk;
+`search-forum-topics` results stay live and are never cached.
 
 - `src/oauth.rs` — PKCE S256, loopback redirect on ephemeral port, refresh grant.
 - `src/storage.rs` — atomic-rename JSON file at the platform config dir (0600 on Unix).
