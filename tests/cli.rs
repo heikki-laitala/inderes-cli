@@ -26,7 +26,6 @@ fn isolated() -> (Command, TempDir) {
     cmd.env_remove("INDERES_IDP_TOKEN_URL");
     cmd.env_remove("INDERES_IDP_USERINFO_URL");
     cmd.env_remove("INDERES_IDP_CLIENT_ID");
-    cmd.env_remove("INDERES_FORUM_URL");
     cmd.env_remove("INDERES_FORUM_DB");
     (cmd, tmp)
 }
@@ -69,7 +68,7 @@ fn help_lists_all_subcommands() {
 fn forum_help_lists_subcommands() {
     let (mut cmd, _tmp) = isolated();
     let mut assertion = cmd.args(["forum", "--help"]).assert().success();
-    for sub in ["search", "topic", "latest", "categories"] {
+    for sub in ["search", "topic", "query", "momentum", "refresh-all"] {
         assertion = assertion.stdout(predicate::str::contains(sub));
     }
 }

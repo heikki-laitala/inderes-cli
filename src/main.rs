@@ -121,7 +121,8 @@ enum Command {
     #[command(subcommand)]
     Documents(DocumentsCmd),
 
-    /// Read the public Inderes forum (forum.inderes.com). No login required.
+    /// Read the Inderes forum (forum.inderes.com) via the MCP server. Requires
+    /// `inderes login`.
     #[command(subcommand)]
     Forum(ForumCmd),
 
@@ -209,7 +210,7 @@ enum ContentCmd {
 
 #[derive(Debug, Subcommand)]
 enum ForumCmd {
-    /// Full-text search across forum topics and posts.
+    /// Search forum topic titles (up to 10 matching threads).
     Search {
         /// Free-text query.
         query: String,
@@ -219,15 +220,11 @@ enum ForumCmd {
     Topic {
         /// Numeric topic ID (the number in a /t/<slug>/<id> URL).
         id: String,
-        /// Re-fetch the whole thread from page 1, replacing the cached copy
+        /// Re-fetch the whole thread from the start, replacing the cached copy
         /// (picks up edited or deleted posts).
         #[arg(long)]
         refresh: bool,
     },
-    /// List the latest active topics.
-    Latest,
-    /// List forum categories.
-    Categories,
     /// Run a read-only SQL query against the local forum cache.
     Query {
         /// SQL to run (e.g. "SELECT username, COUNT(*) FROM posts GROUP BY username").
@@ -397,8 +394,6 @@ async fn run() -> Result<()> {
         Command::Forum(ForumCmd::Topic { id, refresh }) => {
             commands::forum_topic(&ctx, &id, refresh).await
         }
-        Command::Forum(ForumCmd::Latest) => commands::forum_latest(&ctx).await,
-        Command::Forum(ForumCmd::Categories) => commands::forum_categories(&ctx).await,
         Command::Forum(ForumCmd::Query { sql }) => commands::forum_query(&ctx, &sql),
         Command::Forum(ForumCmd::Activity {
             id,

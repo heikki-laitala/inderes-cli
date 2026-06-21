@@ -40,16 +40,14 @@ Then call a friendly subcommand:
 
 Append `--json` on any subcommand to get raw JSON (easier to post-process).
 
-## Forum (public, no login)
+## Forum (via the MCP server, requires login)
 
-`inderes forum` reads the public Inderes forum (forum.inderes.com) directly — **no `inderes login` required**; it sends no credentials. Use it for community/retail sentiment and discussion, as distinct from analyst research.
+`inderes forum` reads the Inderes forum (forum.inderes.com) through the hosted MCP server — `inderes login` (Premium) is required, like every other subcommand. Use it for community/retail sentiment and discussion, as distinct from analyst research.
 
 ```bash
-inderes forum search "Nokia"      # full-text search across topics and posts
+inderes forum search "Nokia"      # search topic titles (up to 10 matches)
 inderes forum topic 74            # full thread (read-through SQLite cache)
-inderes forum topic 74 --refresh  # re-fetch from page 1, updating edits
-inderes forum latest              # latest active topics
-inderes forum categories          # category list
+inderes forum topic 74 --refresh  # re-fetch from the start, updating edits
 inderes forum query "<SQL>"       # read-only SQL over the cached posts
 inderes forum activity 74         # posting volume over time (momentum)
 inderes forum momentum           # rank ALL cached topics by momentum
@@ -59,11 +57,11 @@ inderes forum clear <id>         # drop one cached topic (--all to wipe)
 inderes forum db-path             # path to the local SQLite cache
 ```
 
-Add `--json` for raw Discourse fields (`cooked` = post body HTML, `username`, `created_at`) when extracting post text for analysis. `forum topic` returns the **whole** thread, backed by a local SQLite read-through cache: only new posts are fetched each call, and the full thread is served from disk (first call on a huge thread is slow but resumable; re-run if interrupted). This is separate from the authenticated MCP tool `inderes call search-forum-topics`. Cached posts are queryable with `inderes forum query "<SQL>"` (read-only) — e.g. most active users on a stock, or posting volume over time.
+`forum search` wraps the `search-forum-topics` MCP tool (title match, max 10) and prints each thread's id so it feeds straight into `forum topic <id>`. `forum topic` pulls the **whole** thread via the `get-forum-posts` tool into a local SQLite read-through cache: only new posts are fetched each call (resumable — re-run if interrupted), and the full thread is served from disk. Add `--json` for the raw fields (`cooked` = markdown body, `username`, `created_at`, plus `url`/`score`/`reply_count` in `raw`). A thread opened by bare id shows as `(untitled)` — the server returns no thread title; the title appears in `forum search` results. Cached posts are queryable with `inderes forum query "<SQL>"` (read-only) — e.g. most active users on a stock, or posting volume over time.
 
 ## Analyzing cached threads (you reason, the CLI only serves data)
 
-The cache has a clean-text `text` column (HTML stripped) — query `text`, not `cooked`, to save tokens. Cache a topic first with `inderes forum topic <id>`, then:
+The cache has a clean-text `text` column — query `text` for post bodies. Cache a topic first with `inderes forum topic <id>`, then:
 
 - **Catch me up** (recent posts): `inderes --json forum query "SELECT post_number, username, date(created_at) d, text FROM posts WHERE topic_id=74 ORDER BY post_number DESC LIMIT 40"` → summarize the result yourself.
 - **Summarize a long thread** (map-reduce — a big thread won't fit in context): pull it in chunks, summarize each, then combine. Get the size with `SELECT MAX(post_number) FROM posts WHERE topic_id=74`, then `... WHERE topic_id=74 AND post_number BETWEEN 1 AND 500 ORDER BY post_number` (repeat for 501–1000, …).

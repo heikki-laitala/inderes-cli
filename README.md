@@ -121,27 +121,25 @@ Every tool-calling subcommand accepts `--json` to emit raw MCP output:
 inderes --json search "Nokia" | jq '.content[0].text'
 ```
 
-### Forum (public, no login)
+### Forum (via the MCP server)
 
-`inderes forum` reads the public [Inderes forum](https://forum.inderes.com) (a Discourse instance) directly over its JSON API. This path is **independent of the MCP server and Keycloak** — it sends no credentials and reads only public content, so it works before (and without) `inderes login`.
+`inderes forum` reads the [Inderes forum](https://forum.inderes.com) through the hosted MCP server's `search-forum-topics` and `get-forum-posts` tools, so it needs `inderes login` like every other subcommand. Use it for community/retail sentiment and discussion, as distinct from analyst research.
 
 ```bash
-inderes forum search "Nokia"      # full-text search across topics and posts
+inderes forum search "Nokia"      # search topic titles (up to 10 matches)
 inderes forum topic 74            # full thread, cached locally (see below)
-inderes forum topic 74 --refresh  # re-fetch from page 1, updating edited posts
-inderes forum latest              # latest active topics
-inderes forum categories          # category list
+inderes forum topic 74 --refresh  # re-fetch from the start, updating edited posts
 ```
 
-`--json` emits the raw Discourse fields (`cooked`, `username`, `created_at`, …), handy for scripting or downstream analysis:
+`--json` emits the structured fields (`cooked`, `username`, `created_at`, plus `url`/`score`/`reply_count` in `raw`), handy for scripting or downstream analysis:
 
 ```bash
 inderes --json forum topic 74 | jq '.post_stream.posts[].cooked'
 ```
 
-> **Read-through cache.** `forum topic <id>` is backed by a local SQLite cache: each call fetches only the posts added since last time, stores them, and serves the whole thread from disk — so re-reads are instant and a long thread is downloaded only once. The first call on a very long thread walks every page; it's resumable, so if it's interrupted or rate-limited, just re-run to continue. `--refresh` re-walks from page 1 to pick up edits to older posts — it upserts rather than wiping, so an interrupted refresh never loses the cached copy. The DB lives at the platform data dir; override with `INDERES_FORUM_DB`. Beyond avoiding re-downloads, the cache is a queryable corpus — common fields land in real columns (`username`, `created_at`, `post_number`, `cooked`) for local analysis, and each post's full raw object is kept too, so `--json` stays faithful. Listings (search/latest/categories) are always live, never cached.
+> **Read-through cache.** `forum topic <id>` is backed by a local SQLite cache: each call fetches only the posts added since last time (resuming from a stored pagination cursor), stores them, and serves the whole thread from disk — so re-reads are instant and a long thread is downloaded only once. The first call on a very long thread walks every page; it's resumable, so if it's interrupted or rate-limited, just re-run to continue. `--refresh` re-walks from the start to pick up edits to older posts — it upserts rather than wiping, so an interrupted refresh never loses the cached copy. The DB lives at the platform data dir; override with `INDERES_FORUM_DB`. Beyond avoiding re-downloads, the cache is a queryable corpus — common fields land in real columns (`username`, `created_at`, `post_number`, `cooked`) for local analysis, and each post's full raw object is kept too, so `--json` stays faithful. `forum search` results are always live, never cached.
 >
-> **Why no login.** The forum is open to all, so authentication isn't required — and isn't currently possible anyway: the forum signs in via the same Keycloak but issues a Discourse session cookie rather than a reusable token, and its third-party User-API-Key feature is disabled. If the forum is ever switched to login-required, anonymous reads return 401/403 and the CLI reports that explicitly instead of failing cryptically. Point the forum base elsewhere with `INDERES_FORUM_URL`.
+> **Titles.** `get-forum-posts` returns posts but no thread title, so a thread opened directly by id lists as `(untitled)`; the title is shown by `forum search`. Post bodies arrive as markdown (not Discourse HTML).
 
 **Analyzing the cache.** Once topics are cached, query them with SQL straight from the CLI, or point your own tools at the database file:
 
@@ -172,7 +170,7 @@ inderes forum clear --all    # wipe the cache (prompts; --yes to skip)
 
 `refresh-all` keeps a whole watchlist current in one go, and `forum momentum` then ranks every cached topic by how much it's heating up — the "which company is the crowd suddenly talking about?" view across your watchlist. (An attention signal over cached data; `refresh-all` first for a current picture.)
 
-`forum query` opens the cache **read-only**, so a query can never modify it; table output by default, `--json` emits rows as an array of objects. The `posts` table has typed columns (`id`, `topic_id`, `post_number`, `username`, `created_at`, `cooked`, …), a **`text`** column with the HTML stripped (query this, not `cooked`, for token-cheap reading), and a `raw` column with each post's full JSON (reach any other Discourse field via `json_extract(raw, '$.score')` etc.).
+`forum query` opens the cache **read-only**, so a query can never modify it; table output by default, `--json` emits rows as an array of objects. The `posts` table has typed columns (`id`, `topic_id`, `post_number`, `username`, `created_at`, `cooked`, …), a **`text`** column with the clean post body, and a `raw` column with each post's full JSON (reach any other field — `url`, `score`, `reply_count` — via `json_extract(raw, '$.score')` etc.).
 
 **Model-judgment analysis (summary, sentiment) is done by the agent, not the CLI.** The CLI just serves clean, sliceable data; an agent does the reasoning with its own model — e.g. pull the latest 40 posts' `text` to be caught up, chunk a long thread by `post_number` ranges to summarize it (map-reduce), or classify a high-`score` slice for bull-vs-bear. The installed skills include these query recipes.
 
@@ -228,7 +226,6 @@ inderes completions powershell | Out-String | Invoke-Expression
 | Variable / flag | Purpose | Default |
 |---|---|---|
 | `--endpoint` / `INDERES_MCP_ENDPOINT` | Override the MCP HTTP endpoint | `https://mcp.inderes.com/` |
-| `INDERES_FORUM_URL` | Override the forum base URL used by `inderes forum` | `https://forum.inderes.com` |
 | `INDERES_FORUM_DB` | Override the SQLite cache path for `inderes forum topic` | platform data dir |
 | `--json` | Emit raw JSON from MCP tool calls | off |
 | `-v` / `-vv` | Increase logging verbosity (`warn` → `info` → `debug`) | `warn` |
@@ -259,7 +256,7 @@ Written atomically (tempfile + rename) so a crash can't leave a half-written fil
 - `src/storage.rs` — atomic-rename JSON file at the platform config dir (0600 on Unix).
 - `src/mcp.rs` — MCP 2025-03-26 Streamable HTTP client, handles both `application/json` and `text/event-stream` responses.
 - `src/commands.rs` — subcommand implementations and output formatting.
-- `src/forum.rs` — read-only Discourse JSON client for the public forum (no auth, independent of MCP).
+- `src/forum.rs` — maps and renders forum data read via the MCP `get-forum-posts` / `search-forum-topics` tools.
 - `src/cache.rs` — local SQLite read-through cache + queryable corpus for forum topic posts.
 - `src/skill/{openclaw,hermes,ptrclaw}.md` — embedded at compile time; `inderes install-skill <host>` writes the right one to disk.
 

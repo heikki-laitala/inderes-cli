@@ -1,143 +1,109 @@
-//! Read-only client for the public Discourse JSON API at `forum.inderes.com`.
+//! Forum helpers: mapping and rendering for the Inderes forum, read through the
+//! hosted MCP server's `get-forum-posts` and `search-forum-topics` tools.
 //!
-//! Discourse serves public content as JSON whenever you append `.json` to a
-//! page URL — no authentication required. This is deliberately **separate**
-//! from the MCP/OAuth path: the Keycloak tokens minted for the `inderes-mcp`
-//! client are not valid forum credentials, and Discourse runs its own session
-//! model. We only ever read; we never send credentials here.
+//! Forum reads go over the same authenticated MCP channel as the rest of the
+//! CLI — the server reads `forum.inderes.com` on the user's behalf, so an
+//! `inderes login` (Premium) is required. This module is intentionally
+//! transport-free: `commands.rs` owns the MCP calls and the SQLite cache, while
+//! the pure functions here map a `get-forum-posts` post into the cache's row
+//! shape, render a cached thread, and format `search-forum-topics` results.
 //!
-//! Human output is best-effort (HTML stripped from post bodies). Agents doing
-//! downstream work — e.g. sentiment analysis over posts — should use `--json`
-//! to get the raw Discourse fields (`cooked`, `created_at`, `username`, …).
+//! Post bodies arrive as markdown from the server (not Discourse HTML), so the
+//! cache's clean-text `text` column needs little stripping; `strip_html` is kept
+//! because the cache still runs it and a pre-MCP cache may hold HTML bodies.
 
-use anyhow::{anyhow, bail, Context, Result};
-use serde_json::Value;
+use serde_json::{json, Value};
 
-/// Public Discourse instance. Overridable via `INDERES_FORUM_URL` (used by
-/// tests to point at a mock server; also lets a self-hosted mirror be swapped
-/// in without a recompile).
-pub const DEFAULT_FORUM_URL: &str = "https://forum.inderes.com";
+/// The public forum host. `get-forum-posts` requires a thread URL in the
+/// `/t/<slug>/<id>` shape; the server routes by the trailing id and ignores the
+/// slug, so [`thread_url`] uses a placeholder slug to address a topic by id.
+pub const FORUM_HOST: &str = "https://forum.inderes.com";
 
-/// Resolve the forum base URL from the environment, falling back to the
-/// public Inderes forum.
-pub fn forum_base() -> String {
-    std::env::var("INDERES_FORUM_URL").unwrap_or_else(|_| DEFAULT_FORUM_URL.to_string())
+/// Build a thread URL the `get-forum-posts` tool accepts from a bare topic id.
+/// The slug is a placeholder (`-`): the server routes by the trailing id, so a
+/// real slug is unnecessary and we don't have one when the user types an id.
+pub fn thread_url(topic_id: i64) -> String {
+    format!("{FORUM_HOST}/t/-/{topic_id}")
 }
 
-/// Minimal read-only HTTP client over the Discourse JSON API.
-pub struct ForumClient<'a> {
-    http: &'a reqwest::Client,
-    base: String,
+/// Extract the topic id from a forum thread URL. Search results carry a full
+/// `/t/<slug>/<id>` URL but no bare id; the id is the last path segment that
+/// parses as an integer (topic URLs have no trailing post number).
+pub fn topic_id_from_url(url: &str) -> Option<i64> {
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .find_map(|seg| seg.parse::<i64>().ok())
 }
 
-impl<'a> ForumClient<'a> {
-    pub fn new(http: &'a reqwest::Client, base: &str) -> Self {
-        Self {
-            http,
-            // Normalize so `format!("{base}{path}")` never doubles a slash.
-            base: base.trim_end_matches('/').to_string(),
-        }
-    }
+/// Posts per `get-forum-posts` page. The tool caps `first`/`last` at 50.
+pub const PAGE_SIZE: i64 = 50;
 
-    /// GET a JSON endpoint, treating 404 as an error. Used by the listing
-    /// endpoints (search/latest/categories) where a 404 is genuinely wrong.
-    async fn get_json(&self, path: &str, query: &[(&str, &str)]) -> Result<Value> {
-        self.get_json_opt(path, query)
-            .await?
-            .ok_or_else(|| anyhow!("forum request to {path} returned HTTP 404 Not Found"))
+/// Build the `get-forum-posts` arguments to read one forward page of a thread.
+/// `cursor` is the previous page's `endCursor`; `None` reads from the start.
+/// Forward pagination (`first`/`after`) caches oldest→newest contiguously, so
+/// the stored cursor is always a valid resume point.
+pub fn page_request_args(thread_url: &str, cursor: Option<&str>) -> Value {
+    let mut args = json!({ "threadUrl": thread_url, "first": PAGE_SIZE });
+    if let Some(c) = cursor {
+        args["after"] = json!(c);
     }
+    args
+}
 
-    /// Like `get_json` but returns `Ok(None)` on 404. Topic paging relies on
-    /// this: an out-of-range `?page` 404s, and that is the normal end-of-thread
-    /// signal, not an error.
-    async fn get_json_opt(&self, path: &str, query: &[(&str, &str)]) -> Result<Option<Value>> {
-        let url = format!("{}{}", self.base, path);
-        let resp = self
-            .http
-            .get(&url)
-            .query(query)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        // A 401/403 on an anonymous read is the signature of the forum being
-        // switched to login-required (Discourse `login_required`). Diagnose it
-        // explicitly rather than emitting a bare status. Name the actual base
-        // (overridable via INDERES_FORUM_URL) and keep the advice generic so a
-        // self-hosted mirror isn't told to "ask Inderes".
-        if matches!(
-            status,
-            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-        ) {
-            bail!(
-                "{} denied anonymous access (HTTP {status}) — the forum may require login. \
-                 This CLI reads the forum anonymously and cannot authenticate: Discourse only \
-                 accepts a session cookie or a User-API-Key, and the public Inderes forum has \
-                 its User-API-Key feature disabled. Ask the forum administrators to enable it \
-                 for programmatic access.",
-                self.base
-            );
-        }
-        // Body is intentionally kept out of the error: Discourse error pages
-        // can be large HTML, and we never want to splatter that at the user.
-        if !status.is_success() {
-            bail!("forum request to {path} returned HTTP {status}");
-        }
-        let body = resp.text().await.unwrap_or_default();
-        let value = serde_json::from_str(&body).map_err(|e| {
-            // A 200 carrying HTML (CDN / maintenance / login interstitial) is the
-            // common non-JSON case — say so instead of a bare parse error.
-            if body.trim_start().starts_with('<') {
-                anyhow!(
-                    "forum returned a non-JSON response from {path} (HTTP {status}) — likely an \
-                     HTML page (CDN, maintenance, or login interstitial), not the JSON API"
-                )
-            } else {
-                anyhow!("parsing forum JSON response from {path}: {e}")
-            }
-        })?;
-        Ok(Some(value))
-    }
+/// One parsed page of a thread: the cache-ready posts plus the resume signal.
+#[derive(Debug)]
+pub struct PostsPage {
+    pub posts: Vec<Value>,
+    /// `pageInfo.endCursor` — where the next forward page resumes.
+    pub next_cursor: Option<String>,
+    /// `pageInfo.hasNextPage` — whether more posts follow.
+    pub has_next: bool,
+    /// `pageInfo.totalPosts` — the thread's current size, for topic metadata.
+    pub total_posts: Option<i64>,
+}
 
-    /// Full-text search across topics and posts (`/search.json?q=`).
-    pub async fn search(&self, query: &str) -> Result<Value> {
-        self.get_json("/search.json", &[("q", query)]).await
+/// Pull the cache-ready posts and resume signal out of a `get-forum-posts`
+/// `structuredContent` page. Posts are mapped to the cache row shape; the
+/// `pageInfo` drives forward pagination.
+pub fn parse_posts_page(sc: &Value) -> PostsPage {
+    let posts = sc
+        .get("posts")
+        .and_then(Value::as_array)
+        .map(|ps| ps.iter().map(mcp_post_to_cache).collect())
+        .unwrap_or_default();
+    let page_info = sc.get("pageInfo");
+    PostsPage {
+        posts,
+        next_cursor: page_info
+            .and_then(|pi| pi.get("endCursor"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        has_next: page_info
+            .and_then(|pi| pi.get("hasNextPage"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        total_posts: page_info
+            .and_then(|pi| pi.get("totalPosts"))
+            .and_then(Value::as_i64),
     }
+}
 
-    /// Fetch one page of a topic's post stream (`/t/<id>.json`) for the
-    /// read-through cache. `page` is 1-based and ~20 posts per page; page 1
-    /// omits the query param so it matches the bare URL. `Ok(None)` means the
-    /// page is past the end (Discourse 404s out-of-range pages) — the normal
-    /// loop terminator.
-    pub async fn topic_page(&self, id: &str, page: u32) -> Result<Option<Value>> {
-        // Topic ids are integers; reject anything else so a stray slug or path
-        // segment fails clearly instead of producing a confusing request.
-        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
-            bail!("invalid topic id {id:?}: expected a number (the id in a /t/<slug>/<id> URL)");
-        }
-        let path = format!("/t/{id}.json");
-        let page_s = page.to_string();
-        let query: Vec<(&str, &str)> = if page > 1 {
-            vec![("page", page_s.as_str())]
-        } else {
-            Vec::new()
-        };
-        self.get_json_opt(&path, &query).await
-    }
-
-    /// Latest active topics (`/latest.json`).
-    pub async fn latest(&self) -> Result<Value> {
-        self.get_json("/latest.json", &[]).await
-    }
-
-    /// Forum categories (`/categories.json`).
-    pub async fn categories(&self) -> Result<Value> {
-        self.get_json("/categories.json", &[]).await
-    }
+/// Map one `get-forum-posts` post into the row shape the cache upserts. The
+/// server's markdown `content` goes into `cooked` (where Discourse HTML used to
+/// live) so the existing renderer and `text` derivation keep working; `url`,
+/// `score`, and `reply_count` are carried through so `--json`/SQL over `raw`
+/// stay useful (e.g. ranking by `score`).
+pub fn mcp_post_to_cache(p: &Value) -> Value {
+    json!({
+        "id": p.get("id").and_then(Value::as_i64),
+        "post_number": p.get("postNumber").and_then(Value::as_i64),
+        "username": p.get("username").and_then(Value::as_str),
+        "created_at": p.get("createdAt").and_then(Value::as_str),
+        "cooked": p.get("content").and_then(Value::as_str),
+        "url": p.get("url").and_then(Value::as_str),
+        "score": p.get("score"),
+        "reply_count": p.get("replyCount"),
+    })
 }
 
 // --- human-readable rendering ----------------------------------------------
@@ -145,38 +111,10 @@ impl<'a> ForumClient<'a> {
 // Each renderer returns a String so it can be unit-tested without touching
 // stdout. The `--json` path bypasses all of these and prints the raw value.
 
-/// Search results: one line per matched topic, with a stripped blurb from the
-/// best-matching post when Discourse supplies one.
-pub fn render_search(v: &Value) -> String {
-    // Missing `topics` key = unexpected shape (dump raw); present-but-empty =
-    // a genuine no-results.
-    let Some(topics) = v.get("topics").and_then(Value::as_array) else {
-        return fallback_json(v);
-    };
-    if topics.is_empty() {
-        return "No matching topics.\n".to_string();
-    }
-    let posts = v.get("posts").and_then(Value::as_array);
-    let mut out = String::new();
-    for t in topics {
-        let id = t.get("id").and_then(Value::as_i64).unwrap_or(0);
-        let title = t
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("(untitled)");
-        let count = t.get("posts_count").and_then(Value::as_i64).unwrap_or(0);
-        out.push_str(&format!("#{id}  {title}  ({count} posts)\n"));
-        if let Some(blurb) = posts.and_then(|ps| blurb_for_topic(ps, id)) {
-            out.push_str(&format!("    {}\n", truncate(&strip_html(&blurb), 200)));
-        }
-    }
-    out.push_str("\nOpen a topic with: inderes forum topic <id>\n");
-    out
-}
-
-/// A topic: title followed by every post in the stream, full text (HTML
-/// stripped). Full bodies — not truncated — because the post text is the
-/// payload for downstream analysis.
+/// A topic: title followed by every post in the stream, full body. Full bodies
+/// — not truncated — because the post text is the payload for downstream
+/// analysis. Bodies are markdown; `strip_html` is a no-op on markdown but
+/// cleans up any HTML left from a pre-MCP cache.
 pub fn render_topic(v: &Value) -> String {
     // No post_stream.posts at all = unexpected shape; dump raw JSON instead of
     // masquerading as an empty topic.
@@ -213,57 +151,35 @@ pub fn render_topic(v: &Value) -> String {
     out
 }
 
-/// Latest topics list (`topic_list.topics`).
-pub fn render_latest(v: &Value) -> String {
-    let Some(topics) = v
-        .get("topic_list")
-        .and_then(|l| l.get("topics"))
-        .and_then(Value::as_array)
-    else {
+/// `search-forum-topics` results: one line per matched thread, with the topic
+/// id (parsed from its URL) so the result feeds straight into
+/// `inderes forum topic <id>`.
+pub fn render_forum_search(v: &Value) -> String {
+    // Missing `topics` key = unexpected shape (dump raw); present-but-empty =
+    // a genuine no-results.
+    let Some(topics) = v.get("topics").and_then(Value::as_array) else {
         return fallback_json(v);
     };
     if topics.is_empty() {
-        return "No topics.\n".to_string();
+        return "No matching topics.\n".to_string();
     }
     let mut out = String::new();
     for t in topics {
-        let id = t.get("id").and_then(Value::as_i64).unwrap_or(0);
         let title = t
             .get("title")
             .and_then(Value::as_str)
             .unwrap_or("(untitled)");
-        let count = t.get("posts_count").and_then(Value::as_i64).unwrap_or(0);
-        let views = t.get("views").and_then(Value::as_i64).unwrap_or(0);
-        out.push_str(&format!("#{id}  {title}  ({count} posts, {views} views)\n"));
-    }
-    out.push_str("\nOpen a topic with: inderes forum topic <id>\n");
-    out
-}
-
-/// Categories list (`category_list.categories`).
-pub fn render_categories(v: &Value) -> String {
-    let Some(cats) = v
-        .get("category_list")
-        .and_then(|l| l.get("categories"))
-        .and_then(Value::as_array)
-    else {
-        return fallback_json(v);
-    };
-    if cats.is_empty() {
-        return "No categories.\n".to_string();
-    }
-    let mut out = String::new();
-    for c in cats {
-        let name = c.get("name").and_then(Value::as_str).unwrap_or("(unnamed)");
-        let slug = c.get("slug").and_then(Value::as_str).unwrap_or("");
-        let count = c.get("topic_count").and_then(Value::as_i64).unwrap_or(0);
-        out.push_str(&format!("{name}  [{slug}]  ({count} topics)\n"));
-        if let Some(desc) = c.get("description_text").and_then(Value::as_str) {
-            if !desc.is_empty() {
-                out.push_str(&format!("    {}\n", truncate(desc, 160)));
-            }
+        let count = t.get("postsCount").and_then(Value::as_i64).unwrap_or(0);
+        let id = t
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(topic_id_from_url);
+        match id {
+            Some(id) => out.push_str(&format!("#{id}  {title}  ({count} posts)\n")),
+            None => out.push_str(&format!("    {title}  ({count} posts)\n")),
         }
     }
+    out.push_str("\nOpen a topic with: inderes forum topic <id>\n");
     out
 }
 
@@ -278,26 +194,11 @@ fn fallback_json(v: &Value) -> String {
 
 // --- pure helpers ----------------------------------------------------------
 
-/// Find the `blurb` of the first search post belonging to `topic_id`.
-fn blurb_for_topic(posts: &[Value], topic_id: i64) -> Option<String> {
-    posts.iter().find_map(|p| {
-        let same = p.get("topic_id").and_then(Value::as_i64) == Some(topic_id);
-        if same {
-            p.get("blurb")
-                .and_then(Value::as_str)
-                .filter(|b| !b.is_empty())
-                .map(str::to_string)
-        } else {
-            None
-        }
-    })
-}
-
 /// Best-effort HTML → text for terminal reading: map block boundaries to
 /// newlines (so multi-paragraph posts stay readable), drop remaining tags,
 /// collapse intra-line whitespace while keeping line breaks, then decode the
 /// handful of entities Discourse emits. Not a parser. Also used by the cache to
-/// populate the clean-text `text` column.
+/// populate the clean-text `text` column. A no-op on plain markdown.
 pub(crate) fn strip_html(s: &str) -> String {
     let with_breaks = s
         .replace("</p>", "\n\n")
@@ -346,24 +247,12 @@ fn decode_entities(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// Truncate to at most `max` chars (char-safe), appending `…` when cut.
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max).collect();
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    // --- strip_html / decode_entities / truncate ---------------------------
+    // --- strip_html / decode_entities --------------------------------------
 
     #[test]
     fn strip_html_collapses_intra_line_whitespace_but_keeps_paragraphs() {
@@ -392,73 +281,144 @@ mod tests {
     }
 
     #[test]
-    fn strip_html_on_plain_text_is_identity_modulo_whitespace() {
-        assert_eq!(strip_html("just text"), "just text");
+    fn strip_html_on_markdown_is_identity_modulo_whitespace() {
+        // Server bodies are markdown: links/images pass through untouched.
+        let md = "See [ip fray](https://ipfray.com) for **details**";
+        assert_eq!(strip_html(md), md);
+    }
+
+    // --- thread_url / topic_id_from_url ------------------------------------
+
+    #[test]
+    fn thread_url_addresses_topic_by_id_with_placeholder_slug() {
+        assert_eq!(thread_url(73687), "https://forum.inderes.com/t/-/73687");
     }
 
     #[test]
-    fn truncate_leaves_short_strings_untouched() {
-        assert_eq!(truncate("short", 10), "short");
+    fn topic_id_from_url_takes_the_trailing_numeric_segment() {
+        assert_eq!(
+            topic_id_from_url("https://forum.inderes.com/t/nokia-sijoituskohteena-osa-4/73687"),
+            Some(73687)
+        );
+        // Trailing slash is tolerated.
+        assert_eq!(
+            topic_id_from_url("https://forum.inderes.com/t/x/74/"),
+            Some(74)
+        );
+        // No numeric segment → None (renders without an id rather than wrong).
+        assert_eq!(topic_id_from_url("https://forum.inderes.com/about"), None);
+    }
+
+    // --- mcp_post_to_cache -------------------------------------------------
+
+    #[test]
+    fn mcp_post_to_cache_maps_server_fields_to_cache_columns() {
+        let mcp = json!({
+            "id": 1159826,
+            "url": "https://forum.inderes.com/t/x/73687/1226",
+            "username": "Mustathmir",
+            "createdAt": "2026-06-19T19:42:40.553Z",
+            "content": "Nokia ja Acer ovat allekirjoittaneet sopimuksen.",
+            "postNumber": 1226,
+            "replyCount": 0,
+            "score": 12.5
+        });
+        let row = mcp_post_to_cache(&mcp);
+        assert_eq!(row["id"], 1159826);
+        assert_eq!(row["post_number"], 1226);
+        assert_eq!(row["username"], "Mustathmir");
+        assert_eq!(row["created_at"], "2026-06-19T19:42:40.553Z");
+        // Markdown body lands in `cooked` (so the renderer + text column work).
+        assert_eq!(
+            row["cooked"],
+            "Nokia ja Acer ovat allekirjoittaneet sopimuksen."
+        );
+        // Extras carried through for --json / SQL over raw.
+        assert_eq!(row["url"], "https://forum.inderes.com/t/x/73687/1226");
+        assert_eq!(row["score"], 12.5);
+        assert_eq!(row["reply_count"], 0);
+    }
+
+    // --- pagination helpers ------------------------------------------------
+
+    #[test]
+    fn page_request_args_omits_after_on_the_first_page() {
+        let a = page_request_args("https://forum.inderes.com/t/-/74", None);
+        assert_eq!(a["threadUrl"], "https://forum.inderes.com/t/-/74");
+        assert_eq!(a["first"], 50);
+        assert!(
+            a.get("after").is_none(),
+            "first page must not send a cursor"
+        );
     }
 
     #[test]
-    fn truncate_cuts_and_appends_ellipsis() {
-        let out = truncate("abcdefghij", 5);
-        assert_eq!(out, "abcde…");
+    fn page_request_args_resumes_from_cursor() {
+        let a = page_request_args("https://forum.inderes.com/t/-/74", Some("c42"));
+        assert_eq!(a["after"], "c42");
+        assert_eq!(a["first"], 50);
     }
 
     #[test]
-    fn truncate_is_char_safe_on_multibyte() {
-        // Five multibyte chars, limit 3 — must not panic on a byte boundary.
-        let out = truncate("äöåüö", 3);
-        assert_eq!(out, "äöå…");
+    fn parse_posts_page_maps_posts_and_reads_pageinfo() {
+        let sc = json!({
+            "posts": [
+                {"id": 1, "postNumber": 1, "username": "a", "createdAt": "2026-01-01",
+                 "content": "first", "url": "u1", "replyCount": 0, "score": 0},
+                {"id": 2, "postNumber": 2, "username": "b", "createdAt": "2026-01-02",
+                 "content": "second", "url": "u2", "replyCount": 1, "score": 3}
+            ],
+            "pageInfo": {"endCursor": "2", "hasNextPage": true, "totalPosts": 1176}
+        });
+        let page = parse_posts_page(&sc);
+        assert_eq!(page.posts.len(), 2);
+        assert_eq!(page.posts[0]["post_number"], 1);
+        assert_eq!(page.posts[0]["cooked"], "first");
+        assert_eq!(page.next_cursor.as_deref(), Some("2"));
+        assert!(page.has_next);
+        assert_eq!(page.total_posts, Some(1176));
     }
 
     #[test]
-    fn blurb_for_topic_matches_by_topic_id() {
-        let posts = vec![
-            json!({"topic_id": 1, "blurb": "first"}),
-            json!({"topic_id": 2, "blurb": "second"}),
-        ];
-        assert_eq!(blurb_for_topic(&posts, 2).as_deref(), Some("second"));
-        assert_eq!(blurb_for_topic(&posts, 99), None);
+    fn parse_posts_page_handles_a_terminal_page() {
+        // Last page: no more posts to follow.
+        let sc = json!({"posts": [], "pageInfo": {"endCursor": "9", "hasNextPage": false}});
+        let page = parse_posts_page(&sc);
+        assert!(page.posts.is_empty());
+        assert!(!page.has_next);
+        assert_eq!(page.next_cursor.as_deref(), Some("9"));
+        assert_eq!(page.total_posts, None);
     }
 
     // --- renderers ---------------------------------------------------------
 
     #[test]
-    fn render_search_lists_topics_with_blurbs() {
-        let v = json!({
-            "topics": [{"id": 42, "title": "Revenue beat", "posts_count": 7}],
-            "posts": [{"topic_id": 42, "blurb": "<b>Strong</b> quarter"}]
-        });
-        let out = render_search(&v);
-        assert!(out.contains("#42"));
-        assert!(out.contains("Revenue beat"));
-        assert!(out.contains("7 posts"));
-        // Blurb HTML is stripped.
-        assert!(out.contains("Strong quarter"));
-        assert!(!out.contains("<b>"));
+    fn render_forum_search_lists_topics_with_ids_from_url() {
+        let v = json!({"topics": [
+            {"title": "Nokia sijoituskohteena (Osa 4)", "postsCount": 1176,
+             "url": "https://forum.inderes.com/t/nokia-sijoituskohteena-osa-4/73687"}
+        ]});
+        let out = render_forum_search(&v);
+        assert!(out.contains("#73687"), "got: {out}");
+        assert!(out.contains("Nokia sijoituskohteena (Osa 4)"));
+        assert!(out.contains("1176 posts"));
         assert!(out.contains("inderes forum topic"));
     }
 
     #[test]
-    fn render_search_empty_topics_is_a_genuine_no_result() {
-        // `topics` present but empty = no matches.
+    fn render_forum_search_empty_topics_is_a_genuine_no_result() {
         assert_eq!(
-            render_search(&json!({"topics": []})),
+            render_forum_search(&json!({"topics": []})),
             "No matching topics.\n"
         );
     }
 
     #[test]
     fn render_unrecognized_shape_dumps_raw_json_not_a_fake_empty() {
-        // `topics`/`topic_list`/`category_list`/`post_stream` missing entirely =
-        // unexpected shape; surface it instead of pretending it's empty.
+        // `topics`/`post_stream` missing entirely = unexpected shape; surface it
+        // instead of pretending it's empty.
         for out in [
-            render_search(&json!({"unexpected": 1})),
-            render_latest(&json!({"unexpected": 1})),
-            render_categories(&json!({"unexpected": 1})),
+            render_forum_search(&json!({"unexpected": 1})),
             render_topic(&json!({"unexpected": 1})),
         ] {
             assert!(out.contains("unrecognized"), "got: {out}");
@@ -473,9 +433,9 @@ mod tests {
             "title": "Outlook",
             "post_stream": {"posts": [
                 {"post_number": 1, "username": "alice", "created_at": "2026-01-02",
-                 "cooked": "<p>Bullish on margins</p>"},
+                 "cooked": "Bullish on margins"},
                 {"post_number": 2, "username": "bob", "created_at": "2026-01-03",
-                 "cooked": "<p>Disagree</p>"}
+                 "cooked": "Disagree"}
             ]}
         });
         let out = render_topic(&v);
@@ -485,7 +445,6 @@ mod tests {
         assert!(out.contains("Bullish on margins"));
         assert!(out.contains("#2 @bob"));
         assert!(out.contains("Disagree"));
-        assert!(!out.contains("<p>"));
     }
 
     #[test]
@@ -493,194 +452,5 @@ mod tests {
         let out = render_topic(&json!({"title": "Empty", "post_stream": {"posts": []}}));
         assert!(out.contains("Empty"));
         assert!(out.contains("(no posts)"));
-    }
-
-    #[test]
-    fn render_latest_lists_topics() {
-        let v = json!({"topic_list": {"topics": [
-            {"id": 9, "title": "Daily thread", "posts_count": 120, "views": 4000}
-        ]}});
-        let out = render_latest(&v);
-        assert!(out.contains("#9"));
-        assert!(out.contains("Daily thread"));
-        assert!(out.contains("120 posts"));
-        assert!(out.contains("4000 views"));
-    }
-
-    #[test]
-    fn render_categories_lists_names_and_descriptions() {
-        let v = json!({"category_list": {"categories": [
-            {"name": "Osakkeet", "slug": "osakkeet", "topic_count": 800,
-             "description_text": "Keskustelua osakkeista"}
-        ]}});
-        let out = render_categories(&v);
-        assert!(out.contains("Osakkeet"));
-        assert!(out.contains("[osakkeet]"));
-        assert!(out.contains("800 topics"));
-        assert!(out.contains("Keskustelua osakkeista"));
-    }
-
-    // --- ForumClient (wiremock) -------------------------------------------
-
-    #[tokio::test]
-    async fn search_hits_search_endpoint_with_query() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/search.json"))
-            .and(query_param("q", "nokia"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "topics": [{"id": 1, "title": "Nokia", "posts_count": 3}],
-                "posts": []
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let http = reqwest::Client::new();
-        let client = ForumClient::new(&http, &server.uri());
-        let v = client.search("nokia").await.unwrap();
-        assert_eq!(v["topics"][0]["title"], "Nokia");
-    }
-
-    #[tokio::test]
-    async fn topic_page_1_omits_the_page_query_param() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/t/123.json"))
-            .and(query_param_is_missing("page"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": 123, "title": "Topic", "post_stream": {"posts": []}
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let http = reqwest::Client::new();
-        let client = ForumClient::new(&http, &server.uri());
-        let v = client
-            .topic_page("123", 1)
-            .await
-            .unwrap()
-            .expect("page present");
-        assert_eq!(v["id"], 123);
-    }
-
-    #[tokio::test]
-    async fn topic_page_n_sends_the_page_query_param() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/t/123.json"))
-            .and(query_param("page", "2"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": 123, "title": "T",
-                "post_stream": {"posts": [
-                    {"post_number": 21, "username": "u", "cooked": "<p>x</p>"}
-                ]}
-            })))
-            .expect(1)
-            .mount(&server)
-            .await;
-
-        let http = reqwest::Client::new();
-        let client = ForumClient::new(&http, &server.uri());
-        let v = client
-            .topic_page("123", 2)
-            .await
-            .unwrap()
-            .expect("page present");
-        assert_eq!(v["post_stream"]["posts"][0]["post_number"], 21);
-    }
-
-    #[tokio::test]
-    async fn topic_page_404_signals_end_of_thread() {
-        // An out-of-range page 404s; that is the loop terminator, not an error.
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/t/404.json"))
-            .respond_with(ResponseTemplate::new(404).set_body_string("<html>nope</html>"))
-            .mount(&server)
-            .await;
-
-        let http = reqwest::Client::new();
-        let client = ForumClient::new(&http, &server.uri());
-        assert!(client.topic_page("404", 1).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn server_error_is_an_error_without_body() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/latest.json"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("<html>big error page</html>"))
-            .mount(&server)
-            .await;
-
-        let http = reqwest::Client::new();
-        let client = ForumClient::new(&http, &server.uri());
-        let err = client.latest().await.unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("500"), "got: {msg}");
-        // The HTML body must not leak into the error.
-        assert!(!msg.contains("big error page"), "got: {msg}");
-    }
-
-    #[tokio::test]
-    async fn topic_rejects_non_numeric_id() {
-        // No network needed — validation happens before the request.
-        let http = reqwest::Client::new();
-        let client = ForumClient::new(&http, "https://example.com");
-        let err = client.topic_page("../latest", 1).await.unwrap_err();
-        assert!(
-            format!("{err:#}").contains("invalid topic id"),
-            "got: {err:#}"
-        );
-    }
-
-    #[tokio::test]
-    async fn html_200_is_reported_as_non_json() {
-        // A 200 carrying an HTML interstitial must produce a clear diagnostic,
-        // not a bare serde parse error, and must not leak the HTML body.
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/latest.json"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string("<html><body>DO_NOT_LEAK_42</body></html>"),
-            )
-            .mount(&server)
-            .await;
-
-        let http = reqwest::Client::new();
-        let client = ForumClient::new(&http, &server.uri());
-        let err = client.latest().await.unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("non-JSON"), "got: {msg}");
-        assert!(!msg.contains("DO_NOT_LEAK_42"), "got: {msg}");
-    }
-
-    #[tokio::test]
-    async fn forbidden_is_diagnosed_as_login_required() {
-        // The signature of the forum being flipped to login-required: an
-        // anonymous read returns 403. We must explain it, not just echo 403.
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/latest.json"))
-            .respond_with(ResponseTemplate::new(403).set_body_string(r#"{"errors":["nope"]}"#))
-            .mount(&server)
-            .await;
-
-        let http = reqwest::Client::new();
-        let client = ForumClient::new(&http, &server.uri());
-        let err = client.latest().await.unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("require login"), "got: {msg}");
-        assert!(msg.contains("User-API-Key"), "got: {msg}");
-    }
-
-    #[test]
-    fn new_trims_trailing_slash_from_base() {
-        let http = reqwest::Client::new();
-        let client = ForumClient::new(&http, "https://forum.example.com/");
-        assert_eq!(client.base, "https://forum.example.com");
     }
 }
