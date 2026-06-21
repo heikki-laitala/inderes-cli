@@ -84,7 +84,7 @@ impl Cache {
                     id          INTEGER PRIMARY KEY,
                     title       TEXT,
                     posts_count INTEGER,
-                    last_page   INTEGER NOT NULL DEFAULT 0,
+                    cursor      TEXT,
                     synced_at   TEXT
                  );
                  CREATE TABLE IF NOT EXISTS posts (
@@ -118,6 +118,21 @@ impl Cache {
                 .context("adding text column")?;
             self.backfill_text()?;
         }
+
+        // Caches created before the move from Discourse page numbers to MCP
+        // pagination cursors have a `last_page` column but no `cursor`. Add it;
+        // a pre-`cursor` topic just resumes from the start on its next fetch
+        // (an idempotent re-walk), so no backfill is needed.
+        let has_cursor: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('topics') WHERE name = 'cursor'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_cursor == 0 {
+            self.conn
+                .execute("ALTER TABLE topics ADD COLUMN cursor TEXT", [])
+                .context("adding cursor column")?;
+        }
         Ok(())
     }
 
@@ -145,40 +160,41 @@ impl Cache {
         Ok(())
     }
 
-    /// Highest page already fetched for a topic (0 if the topic is uncached).
-    /// Used as the resume point for incremental fetching.
-    pub fn last_page(&self, topic_id: i64) -> Result<u32> {
-        let v: Option<i64> = self
+    /// The pagination cursor to resume forward fetching from (`None` if the
+    /// topic is uncached or has never been fetched). It marks the end of the
+    /// contiguous run of posts already cached: a fetch resumes with
+    /// `get-forum-posts(after: cursor)` to pull only the posts beyond it.
+    pub fn topic_cursor(&self, topic_id: i64) -> Result<Option<String>> {
+        Ok(self
             .conn
-            .query_row(
-                "SELECT last_page FROM topics WHERE id = ?1",
-                [topic_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(v.unwrap_or(0).max(0) as u32)
+            .query_row("SELECT cursor FROM topics WHERE id = ?1", [topic_id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten())
     }
 
-    /// Record topic metadata and set the page watermark to the last page
-    /// fetched. The walk calls this with monotonically increasing page numbers,
-    /// so the final call stores the true high-water mark — and a `--refresh`
-    /// (or shrink re-walk) that ends on a lower page correctly lowers it.
+    /// Record topic metadata and advance the resume cursor to the end of the
+    /// posts fetched so far. The walk calls this after each page with that
+    /// page's `endCursor`, so the final call stores the true high-water mark.
+    /// A `--refresh` re-walks from the start and overwrites the cursor as it
+    /// goes, so an interrupted refresh never leaves a stale-but-higher cursor.
     pub fn set_topic_meta(
         &self,
         topic_id: i64,
         title: Option<&str>,
         posts_count: Option<i64>,
-        last_page: u32,
+        cursor: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO topics (id, title, posts_count, last_page, synced_at)
+            "INSERT INTO topics (id, title, posts_count, cursor, synced_at)
              VALUES (?1, ?2, ?3, ?4, datetime('now'))
              ON CONFLICT(id) DO UPDATE SET
                 title       = COALESCE(excluded.title, topics.title),
                 posts_count = COALESCE(excluded.posts_count, topics.posts_count),
-                last_page   = excluded.last_page,
+                cursor      = excluded.cursor,
                 synced_at   = excluded.synced_at",
-            params![topic_id, title, posts_count, last_page as i64],
+            params![topic_id, title, posts_count, cursor],
         )?;
         Ok(())
     }
@@ -552,15 +568,16 @@ mod tests {
     }
 
     #[test]
-    fn last_page_defaults_to_zero_then_tracks_watermark() {
+    fn topic_cursor_defaults_to_none_then_tracks_watermark() {
         let c = Cache::open_in_memory().unwrap();
-        assert_eq!(c.last_page(7).unwrap(), 0);
-        c.set_topic_meta(7, Some("Title"), Some(40), 2).unwrap();
-        assert_eq!(c.last_page(7).unwrap(), 2);
-        // The watermark is absolute (a refresh/shrink re-walk that ends lower
-        // must lower it); title is preserved via COALESCE on a None update.
-        c.set_topic_meta(7, None, None, 1).unwrap();
-        assert_eq!(c.last_page(7).unwrap(), 1);
+        assert_eq!(c.topic_cursor(7).unwrap(), None);
+        c.set_topic_meta(7, Some("Title"), Some(40), Some("c2"))
+            .unwrap();
+        assert_eq!(c.topic_cursor(7).unwrap().as_deref(), Some("c2"));
+        // The cursor is overwritten absolutely (a refresh re-walks and resets
+        // it as it goes); title is preserved via COALESCE on a None update.
+        c.set_topic_meta(7, None, None, Some("c1")).unwrap();
+        assert_eq!(c.topic_cursor(7).unwrap().as_deref(), Some("c1"));
         assert_eq!(c.topic_title(7).unwrap().as_deref(), Some("Title"));
     }
 
@@ -748,6 +765,34 @@ mod tests {
     }
 
     #[test]
+    fn migration_adds_cursor_column_to_old_caches() {
+        // A pre-cursor cache has the legacy `last_page` column but no `cursor`.
+        // Opening it must add `cursor` so the resume watermark works; the old
+        // posts/topics are kept (auto-migrate, no wipe).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE posts (id INTEGER PRIMARY KEY, topic_id INTEGER NOT NULL,
+                    post_number INTEGER, username TEXT, created_at TEXT, updated_at TEXT,
+                    cooked TEXT, text TEXT, raw TEXT, fetched_at TEXT);
+                 CREATE TABLE topics (id INTEGER PRIMARY KEY, title TEXT, posts_count INTEGER,
+                    last_page INTEGER NOT NULL DEFAULT 0, synced_at TEXT);
+                 INSERT INTO topics (id, title, last_page) VALUES (7, 'Old', 3);",
+            )
+            .unwrap();
+        }
+        let c = Cache::open_at(&path).unwrap();
+        // The legacy topic survives, and the new cursor column reads as NULL
+        // until the next fetch sets it.
+        assert_eq!(c.topic_title(7).unwrap().as_deref(), Some("Old"));
+        assert_eq!(c.topic_cursor(7).unwrap(), None);
+        c.set_topic_meta(7, None, None, Some("c5")).unwrap();
+        assert_eq!(c.topic_cursor(7).unwrap().as_deref(), Some("c5"));
+    }
+
+    #[test]
     fn open_readonly_migrates_old_cache_so_text_is_queryable() {
         // A pre-`text` cache queried via the read-only path must still be
         // upgraded first, or `SELECT text` would fail with "no such column".
@@ -812,10 +857,11 @@ mod tests {
         let c = Cache::open_in_memory().unwrap();
         c.upsert_posts(7, &[post(1, 1, "a", "x"), post(2, 2, "a", "y")])
             .unwrap();
-        c.set_topic_meta(7, Some("Topic Seven"), Some(2), 1)
+        c.set_topic_meta(7, Some("Topic Seven"), Some(2), Some("c1"))
             .unwrap();
         c.upsert_posts(8, &[post(3, 1, "b", "z")]).unwrap();
-        c.set_topic_meta(8, Some("Eight"), Some(1), 1).unwrap();
+        c.set_topic_meta(8, Some("Eight"), Some(1), Some("c1"))
+            .unwrap();
         let list = c.list_cached().unwrap();
         assert_eq!(list.len(), 2);
         let seven = list.iter().find(|t| t.id == 7).unwrap();
@@ -827,9 +873,9 @@ mod tests {
     fn clear_topic_and_clear_all() {
         let c = Cache::open_in_memory().unwrap();
         c.upsert_posts(7, &[post(1, 1, "a", "x")]).unwrap();
-        c.set_topic_meta(7, Some("S"), Some(1), 1).unwrap();
+        c.set_topic_meta(7, Some("S"), Some(1), Some("c1")).unwrap();
         c.upsert_posts(8, &[post(2, 1, "b", "y")]).unwrap();
-        c.set_topic_meta(8, Some("E"), Some(1), 1).unwrap();
+        c.set_topic_meta(8, Some("E"), Some(1), Some("c1")).unwrap();
 
         c.clear_topic(7).unwrap();
         assert_eq!(c.post_count(7).unwrap(), 0);
@@ -844,8 +890,8 @@ mod tests {
     #[test]
     fn cached_topic_ids_lists_all() {
         let c = Cache::open_in_memory().unwrap();
-        c.set_topic_meta(7, None, None, 1).unwrap();
-        c.set_topic_meta(8, None, None, 1).unwrap();
+        c.set_topic_meta(7, None, None, None).unwrap();
+        c.set_topic_meta(8, None, None, None).unwrap();
         assert_eq!(c.cached_topic_ids().unwrap(), vec![7, 8]);
     }
 

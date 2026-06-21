@@ -102,6 +102,52 @@ impl<'a> ToolCtx<'a> {
         let _ = c.close().await;
         print_result(&result?, self.json_output)
     }
+
+    /// Call a tool and return its raw result envelope, erroring on an
+    /// `isError` result. For callers that need the structured data (to cache or
+    /// re-render) rather than printing it straight through like [`call`].
+    async fn call_raw(&self, tool: &str, args: Value) -> Result<Value> {
+        let mut c = self.client().await?;
+        let result = c.call_tool(tool, args).await;
+        let _ = c.close().await;
+        let result = result?;
+        if let Some(msg) = result_error_text(&result) {
+            bail!("MCP tool {tool} returned an error: {msg}");
+        }
+        Ok(result)
+    }
+}
+
+/// If an MCP result is an error (`isError: true`), return its rendered text for
+/// a diagnostic; otherwise `None`. Keeps the error message off the happy path.
+fn result_error_text(result: &Value) -> Option<String> {
+    if result.get("isError").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let mut buf = Vec::new();
+    let _ = render_result(result, &mut buf);
+    Some(String::from_utf8_lossy(&buf).trim().to_string())
+}
+
+/// Extract a tool result's structured payload: `structuredContent` if present,
+/// else the first text content item parsed as JSON. Forum fetching and search
+/// both need the typed object, not the human-rendered text.
+fn structured_content(result: &Value) -> Result<Value> {
+    if let Some(sc) = result.get("structuredContent") {
+        return Ok(sc.clone());
+    }
+    let text = result
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items.iter().find_map(|i| {
+                (i.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| i.get("text").and_then(Value::as_str))
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| anyhow!("MCP result had no structuredContent or text content"))?;
+    serde_json::from_str(text).context("parsing MCP text content as JSON")
 }
 
 pub async fn search(ctx: &ToolCtx<'_>, query: &str) -> Result<()> {
@@ -236,24 +282,27 @@ pub async fn documents_read(
     .await
 }
 
-// --- forum (public Discourse, no auth) -------------------------------------
-
-fn forum_client<'a>(ctx: &ToolCtx<'a>) -> forum::ForumClient<'a> {
-    forum::ForumClient::new(ctx.http, &forum::forum_base())
-}
+// --- forum (read via the MCP server, requires login) -----------------------
 
 pub async fn forum_search(ctx: &ToolCtx<'_>, query: &str) -> Result<()> {
-    let v = forum_client(ctx).search(query).await?;
-    print_forum(&v, ctx.json_output, forum::render_search)
+    let result = ctx
+        .call_raw(
+            "search-forum-topics",
+            json!({ "text": query, "order": "relevancy" }),
+        )
+        .await?;
+    let sc = structured_content(&result)?;
+    print_forum(&sc, ctx.json_output, forum::render_forum_search)
 }
 
 /// Read a full topic through the local SQLite cache. On each call it resumes
-/// fetching from the last cached page (re-fetching it to catch newly-appended
-/// posts), walks until a page 404s, upserts as it goes, then renders the whole
-/// thread from the cache. A mid-walk error keeps progress and serves what's
-/// cached, so re-running resumes from the watermark.
+/// fetching from the stored pagination cursor (the end of what's cached),
+/// walking forward page by page via the `get-forum-posts` tool and upserting as
+/// it goes, then renders the whole thread from the cache. A mid-walk error
+/// keeps progress and serves what's cached, so re-running resumes from the
+/// cursor.
 ///
-/// `--refresh` re-walks from page 1 (picking up edits to older posts). It
+/// `--refresh` re-walks from the start (picking up edits to older posts). It
 /// upserts rather than wiping first, so a refresh interrupted by a rate limit
 /// or network error never destroys the previously-complete cached copy.
 pub async fn forum_topic(ctx: &ToolCtx<'_>, id: &str, refresh: bool) -> Result<()> {
@@ -261,20 +310,13 @@ pub async fn forum_topic(ctx: &ToolCtx<'_>, id: &str, refresh: bool) -> Result<(
         .parse()
         .map_err(|_| anyhow!("invalid topic id {id:?}: expected a number"))?;
     let cache = cache::Cache::open()?;
-    let client = forum_client(ctx);
 
     let start = if refresh {
-        1
+        None
     } else {
-        cache.last_page(topic_id)?.max(1)
+        cache.topic_cursor(topic_id)?
     };
-    let (fetched_any, _) = fetch_topic_incremental(&client, &cache, id, topic_id, start).await?;
-    if !fetched_any && start > 1 && cache.post_count(topic_id)? > 0 {
-        eprintln!(
-            "warning: forum topic {id} returned 404 (deleted or made private); \
-             serving the cached copy."
-        );
-    }
+    fetch_topic(ctx, &cache, topic_id, start).await?;
 
     if cache.post_count(topic_id)? == 0 {
         bail!("forum topic {id} not found or has no posts");
@@ -288,86 +330,63 @@ pub async fn forum_topic(ctx: &ToolCtx<'_>, id: &str, refresh: bool) -> Result<(
     print_forum(&envelope, ctx.json_output, forum::render_topic)
 }
 
-/// Walk a topic's pages from `start` until a page 404s (end of thread),
-/// upserting each page into the cache. Returns `(fetched_any, interrupted)`:
-/// `fetched_any` is whether any page yielded posts, `interrupted` is whether a
-/// transient error (rate limit / network) stopped the walk with cached posts
-/// still available to serve.
-async fn walk_topic_pages(
-    client: &forum::ForumClient<'_>,
+/// Walk a thread forward from `cursor` (`None` = from the start) via the
+/// `get-forum-posts` tool, upserting each page into the cache and advancing the
+/// stored resume cursor. Returns whether the walk was interrupted: a transient
+/// error — or a deleted/private topic — stops the walk and, if posts are
+/// already cached, serves them and warns rather than erroring. The walk stops
+/// when the server reports no further pages (or returns an empty page, i.e.
+/// we're already caught up). Shared by `forum topic` and `refresh-all`.
+async fn fetch_topic(
+    ctx: &ToolCtx<'_>,
     cache: &cache::Cache,
-    id: &str,
     topic_id: i64,
-    start: u32,
-) -> Result<(bool, bool)> {
-    let mut page = start;
-    let mut fetched_any = false;
+    mut cursor: Option<String>,
+) -> Result<bool> {
+    let url = forum::thread_url(topic_id);
+    let mut client = ctx.client().await?;
     loop {
-        let v = match client.topic_page(id, page).await {
-            Ok(Some(v)) => v,
-            Ok(None) => return Ok((fetched_any, false)), // past the end
-            Err(e) => {
-                if cache.post_count(topic_id)? > 0 {
-                    eprintln!(
-                        "warning: forum fetch stopped at page {page} ({e:#}); \
-                         serving cached posts — re-run to resume."
-                    );
-                    return Ok((fetched_any, true));
+        let args = forum::page_request_args(&url, cursor.as_deref());
+        // A transport error or an `isError` result is a fetch failure: serve
+        // cached posts (with a warning) when we have any, else propagate.
+        let fail = match client.call_tool("get-forum-posts", args).await {
+            Ok(result) => match result_error_text(&result) {
+                Some(msg) => Some(msg),
+                None => {
+                    let page = forum::parse_posts_page(&structured_content(&result)?);
+                    if page.posts.is_empty() {
+                        break; // empty thread, or resumed past the last post
+                    }
+                    cache.upsert_posts(topic_id, &page.posts)?;
+                    cache.set_topic_meta(
+                        topic_id,
+                        None,
+                        page.total_posts,
+                        page.next_cursor.as_deref(),
+                    )?;
+                    cursor = page.next_cursor;
+                    if !page.has_next {
+                        break;
+                    }
+                    None
                 }
-                return Err(e);
-            }
+            },
+            Err(e) => Some(format!("{e:#}")),
         };
-        let posts = v
-            .get("post_stream")
-            .and_then(|s| s.get("posts"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if posts.is_empty() {
-            return Ok((fetched_any, false));
+        if let Some(msg) = fail {
+            let _ = client.close().await;
+            if cache.post_count(topic_id)? > 0 {
+                eprintln!(
+                    "warning: forum fetch for topic {topic_id} stopped ({msg}); \
+                     serving cached posts — re-run to resume."
+                );
+                return Ok(true);
+            }
+            bail!("fetching forum topic {topic_id}: {msg}");
         }
-        cache.upsert_posts(topic_id, &posts)?;
-        cache.set_topic_meta(
-            topic_id,
-            v.get("title").and_then(Value::as_str),
-            v.get("posts_count").and_then(Value::as_i64),
-            page,
-        )?;
-        fetched_any = true;
-        page += 1;
     }
-}
-
-/// Incrementally fetch a topic into the cache: walk from `start` until 404; if a
-/// resumed walk (start > 1) 404s immediately without fetching or erroring,
-/// re-verify from page 1 — that re-walks a shrunk thread (lowering a now-stale
-/// watermark) or confirms the topic is gone. Returns `(fetched_any,
-/// interrupted)`. Shared by `forum topic` and `refresh-all`.
-async fn fetch_topic_incremental(
-    client: &forum::ForumClient<'_>,
-    cache: &cache::Cache,
-    id: &str,
-    topic_id: i64,
-    start: u32,
-) -> Result<(bool, bool)> {
-    let (mut fetched_any, mut interrupted) =
-        walk_topic_pages(client, cache, id, topic_id, start).await?;
-    if !fetched_any && !interrupted && start > 1 {
-        let (f, i) = walk_topic_pages(client, cache, id, topic_id, 1).await?;
-        fetched_any = f;
-        interrupted = i;
-    }
-    Ok((fetched_any, interrupted))
-}
-
-pub async fn forum_latest(ctx: &ToolCtx<'_>) -> Result<()> {
-    let v = forum_client(ctx).latest().await?;
-    print_forum(&v, ctx.json_output, forum::render_latest)
-}
-
-pub async fn forum_categories(ctx: &ToolCtx<'_>) -> Result<()> {
-    let v = forum_client(ctx).categories().await?;
-    print_forum(&v, ctx.json_output, forum::render_categories)
+    let _ = client.close().await;
+    Ok(false)
 }
 
 /// Print a forum response: raw pretty JSON under `--json`, otherwise the
@@ -457,16 +476,14 @@ pub async fn forum_refresh_all(ctx: &ToolCtx<'_>) -> Result<()> {
         println!("No cached topics to refresh.");
         return Ok(());
     }
-    let client = forum_client(ctx);
     let count = ids.len();
     let mut total_new = 0i64;
     let mut incomplete = 0usize;
     for topic_id in ids {
         let before = cache.post_count(topic_id)?;
-        let start = cache.last_page(topic_id)?.max(1);
-        let id_str = topic_id.to_string();
-        match fetch_topic_incremental(&client, &cache, &id_str, topic_id, start).await {
-            Ok((_, interrupted)) => {
+        let start = cache.topic_cursor(topic_id)?;
+        match fetch_topic(ctx, &cache, topic_id, start).await {
+            Ok(interrupted) => {
                 let new = cache.post_count(topic_id)? - before;
                 total_new += new;
                 if interrupted {
