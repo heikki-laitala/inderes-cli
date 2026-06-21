@@ -101,12 +101,12 @@ inderes documents read <documentId> -s 1,2,5
 
 ### The 16-tool escape hatch
 
-Friendly subcommands cover ~half of Inderes's MCP surface. For the rest:
+Friendly subcommands cover 10 of Inderes's 16 MCP tools. For the rest:
 
 ```bash
 inderes call --list                                       # see all tools
 inderes call list-transcripts --arg companyId=COMPANY:200
-inderes call search-forum-topics --arg text=Nokia --arg order=relevancy
+inderes call list-insider-transactions --arg companyId=COMPANY:200
 inderes call list-calendar-events --arg 'regions=["FINLAND","SWEDEN"]'
 inderes call get-model-portfolio-content
 ```
